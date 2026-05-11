@@ -1,0 +1,56 @@
+name: kneedle
+description: Kneedle — on-device AI knee arthritis companion. Powered by Gemma 4 E2B.
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: ">=3.4.0 <4.0.0"
+  flutter: ">=3.22.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # State management
+  flutter_riverpod: ^2.5.1
+
+  # On-device LLM — Gemma 4 E2B via LiteRT
+  flutter_gemma: ^0.15.0
+
+  # Pose & camera
+  flutter_pose_detection: ^0.4.1
+  camera: ^0.11.0+2
+
+  # Voice
+  speech_to_text: ^7.0.0
+  flutter_tts: ^4.0.2
+
+  # Storage (Hive — embedded, no codegen needed for inline adapters)
+  hive: ^2.2.3
+  hive_flutter: ^1.1.0
+  path_provider: ^2.1.4
+
+  # Notifications
+  flutter_local_notifications: ^17.2.2
+  timezone: ^0.9.4
+  flutter_timezone: ^3.0.1
+
+  # PDF export
+  pdf: ^3.11.1
+  printing: ^5.13.2
+  share_plus: ^10.1.4
+
+  # Utility
+  permission_handler: ^11.3.1
+  intl: ^0.19.0
+  collection: ^1.18.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^4.0.0
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/prompts/
