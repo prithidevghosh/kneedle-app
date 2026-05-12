@@ -14,8 +14,15 @@ class GaitConst {
   static const double minFrameConfidence = 0.6;
 
   /// Minimum per-landmark visibility for that landmark to participate in an
-  /// angle calculation.
-  static const double minLandmarkVis = 0.5;
+  /// angle calculation. Lowered from the backend's 0.5 to 0.3 because in a
+  /// hand-held / single-pass tripod sagittal recording the FAR-side leg is
+  /// occluded for most of the gait cycle and MediaPipe assigns it visibility
+  /// in the 0.3-0.5 band (its predicted-occluded estimates). At 0.5 we get
+  /// zero far-side knee samples and `samples_balanced` always fails, so
+  /// `symmetry_score` and `knee_angle_diff` come back null. 0.3 is the
+  /// MediaPipe-recommended floor for occlusion-tolerant tracking — noisier
+  /// per-frame angles, but avgFullCycle averages it out.
+  static const double minLandmarkVis = 0.3;
 }
 
 /// Gait phase boundaries as `(lo%, hi%, label)` from heel strike.

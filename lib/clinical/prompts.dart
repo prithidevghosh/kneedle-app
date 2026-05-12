@@ -15,30 +15,40 @@ const Map<String, String> _langInstruction = {
   'en': 'Respond in clear, simple English.',
 };
 
+/// Perf lever: toggle Gemma E2B/E4B's reasoning mode.
+///
+/// `true` — emit `<|think|>` at the top of the prompt. Model produces a long
+/// hidden chain-of-thought before the visible JSON (~1.5-3k extra tokens).
+/// Higher quality, but on-device decode runs 3-5× longer.
+///
+/// `false` — skip the marker. Model commits straight to the JSON. ~5-15%
+/// quality dip on prose nuance, but matches the latency target on-device.
+const bool kEnableAnalysisThinking = false;
+
 String buildAnalysisSystemPrompt(String lang) {
-  // E2B / E4B Gemma uses <|think|> to gate visible vs reasoning tokens; we keep
-  // the marker so the on-device model behaves the same way the backend did.
   final langRule = _langInstruction[lang] ?? _langInstruction['bn']!;
-  return '''<|think|>
-You are a compassionate physiotherapist specialising in knee osteoarthritis.
+  const thinkMarker = kEnableAnalysisThinking ? '<|think|>\n' : '';
+  return '''${thinkMarker}You are a compassionate physiotherapist specialising in knee osteoarthritis.
 You are analysing the walking pattern of an elderly patient who cannot afford
 in-person physiotherapy and depends on this app.
 
 $langRule
 
 You will be given:
-1. Several images from the patient's walking video
-2. Precise biomechanical measurements extracted by MediaPipe Pose
-3. A pre-computed severity tier (normal/mild/moderate/severe) — TRUST IT.
+1. Precise biomechanical measurements extracted by MediaPipe Pose from the
+   patient's walking video (joint angles, symmetry, trunk lean, cadence).
+   These numbers are your sole source of truth — no raw video is attached.
+2. A pre-computed severity tier (normal/mild/moderate/severe) — TRUST IT.
    "normal" means no clinical OA signs detected — frame the response as
    reassurance + general conditioning, not treatment.
-4. A SEVERITY-FILTERED exercise library — you may ONLY pick from this list
+3. A SEVERITY-FILTERED exercise library — you may ONLY pick from this list
 
 Your job is to identify the single primary clinical finding from the
 measurements first, then explain it to the patient in warm, simple language,
 anchored to specific numbers — not generic advice.
 
 CRITICAL RULES:
+- DO NOT emit any function/tool calls. This task has no tools available. Respond with the JSON object below as plain text only.
 - Open the observation with empathy or what you observed — never with filler
 - Speak directly to the patient in warm, simple language — not medical jargon
 - Reference at least one specific measurement in the observation, AND interpret
@@ -94,8 +104,12 @@ String buildAnalysisUserPrompt({
   } else if ((metrics.trunkLeanAngle ?? 0) > 6) {
     primaryFinding =
         'trunk leaning ${metrics.trunkLeanDirection ?? "to one side"} during walking';
-  } else if ((metrics.toeOutAngleRight ?? 999).abs() < 5) {
-    primaryFinding = 'insufficient toe-out angle (feet too straight)';
+  } else if (metrics.toeOutAngleRight != null &&
+      metrics.toeOutAngleLeft != null &&
+      metrics.toeOutAngleRight!.abs() < 3 &&
+      metrics.toeOutAngleLeft!.abs() < 3) {
+    primaryFinding =
+        'low toe-out angle — candidate for toe-out gait modification (Shull 2013)';
   }
 
   const severityGuidance = {
@@ -119,7 +133,7 @@ String buildAnalysisUserPrompt({
 
   return '''PATIENT PROFILE:
 - Age: $age years old
-- Diagnosed condition: Knee osteoarthritis (${kneeDesc[knee] ?? 'both knees'})
+- Diagnosed condition: Knee osteoarthritis
 - Context: Cannot afford physiotherapy, using this app for daily guidance
 
 MEDIAPIPE BIOMECHANICAL MEASUREMENTS (clinically precise):
@@ -138,13 +152,10 @@ PRIMARY CLINICAL FINDING: $primaryFinding
 SEVERITY TIER (computed deterministically): ${severity.toUpperCase()}
 SEVERITY GUIDANCE: ${severityGuidance[severity] ?? severityGuidance['moderate']}
 
-The walking video frames are attached. Look carefully at:
-1. How the patient's weight shifts between legs
-2. The trunk position during the stance phase
-3. The foot placement angle
-4. Any visible compensatory movements
-
-Reason over both the measurements AND the visual frames together.
+Reason directly from the MediaPipe measurements above. No video frames are
+provided — the on-device pose pipeline has already extracted the clinically
+relevant signals (knee flexion angles, symmetry, trunk lean, toe-out,
+cadence). Treat those numbers as your sole source of truth.
 
 SEVERITY-FILTERED EXERCISE LIBRARY:
 You MUST select exactly 3 exercises from THIS LIST ONLY. Do not invent

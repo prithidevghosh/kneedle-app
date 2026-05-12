@@ -1,7 +1,5 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:typed_data';
-
 import 'package:flutter/services.dart' show rootBundle;
 import 'package:flutter_gemma/flutter_gemma.dart';
 
@@ -11,6 +9,8 @@ import '../clinical/severity.dart';
 import '../data/exercise_library.dart';
 import '../gait/pipeline.dart';
 import '../models/analysis_response.dart';
+import '../models/appointment.dart';
+import '../models/medication.dart';
 import '../models/pain_entry.dart';
 import 'notification_service.dart';
 import 'storage_service.dart';
@@ -52,7 +52,10 @@ class GemmaService {
   static const _modelUrl =
       'https://huggingface.co/litert-community/gemma-4-E2B-it-litert-lm/resolve/7fa1d78473894f7e736a21d920c3aa80f950c0db/gemma-4-E2B-it.litertlm';
 
-  static const _supportImage = true;
+  // Vision path is disabled — gait analysis is text-only (metrics + library),
+  // and the companion chat doesn't accept images. Keeping this off reduces
+  // model memory and avoids loading the vision encoder.
+  static const _supportImage = false;
 
   InferenceModel? _model;
   InferenceChat? _chat;
@@ -67,26 +70,39 @@ class GemmaService {
     if (isReady || _initialising) return;
     _initialising = true;
     try {
+      // ignore: avoid_print
+      print('[GemmaService] init step 1/4: loading system prompt asset');
       _systemPrompt =
           await rootBundle.loadString('assets/prompts/companion_system.txt');
 
+      // ignore: avoid_print
+      print('[GemmaService] init step 2/4: installing model from network '
+          '(first launch downloads ~1.5 GB)');
       await FlutterGemma.installModel(
         modelType: ModelType.gemma4,
         fileType: ModelFileType.litertlm,
       )
           .fromNetwork(_modelUrl)
-          .withProgress((p) => onDownloadProgress?.call(p / 100.0))
+          .withProgress((p) {
+            onDownloadProgress?.call(p / 100.0);
+            // Throttle: only log every ~10% so the console doesn't flood.
+            final whole = p.toInt();
+            if (whole % 10 == 0 && whole != _lastLoggedPct) {
+              _lastLoggedPct = whole;
+              // ignore: avoid_print
+              print('[GemmaService] download progress: $whole%');
+            }
+          })
           .install();
+      // ignore: avoid_print
+      print('[GemmaService] init step 2/4: download complete');
 
-      _model = await FlutterGemma.getActiveModel(
-        preferredBackend: PreferredBackend.gpu,
-        // will change later — lowered from 8192 to fit 4 GB test device.
-        // 4096 is still > the trimmed analysis prompt (~1.6–2k tokens) with
-        // generation headroom. Bump back up once we test on ≥8 GB hardware.
-        maxTokens: 4096,
-        supportImage: _supportImage,
-      );
+      // ignore: avoid_print
+      print('[GemmaService] init step 3/4: loading model into runtime');
+      _model = await _loadModelWithFallback();
 
+      // ignore: avoid_print
+      print('[GemmaService] init step 4/4: creating chat session');
       _chat = await _model!.createChat(
         temperature: 0.6,
         topK: 40,
@@ -99,9 +115,69 @@ class GemmaService {
       await _chat!.addQueryChunk(
         Message.text(text: _systemPrompt!, isUser: true),
       );
+
+      // Warm the session: force the model to prefill the system prompt now,
+      // during the loading screen, instead of paying ~20s on the user's first
+      // real message. The system prompt asks the model to acknowledge with a
+      // single token ("Ready."), so the discarded decode is ~1 chunk. After
+      // this returns, subsequent turns prefill incrementally over the cached
+      // system-prompt KV.
+      // ignore: avoid_print
+      print('[GemmaService] init step 4/4: warming session (prefilling system prompt)');
+      final warmSw = Stopwatch()..start();
+      try {
+        final warm = await _chat!.generateChatResponse();
+        final preview = warm is TextResponse ? warm.token : '';
+        // ignore: avoid_print
+        print('[GemmaService] warmup done in ${warmSw.elapsedMilliseconds}ms '
+            '(model said: "${preview.trim()}")');
+      } catch (e) {
+        // ignore: avoid_print
+        print('[GemmaService] warmup failed (non-fatal): $e');
+      }
+      // ignore: avoid_print
+      print('[GemmaService] init complete — model ready');
+    } catch (e, st) {
+      // ignore: avoid_print
+      print('[GemmaService] init FAILED: $e\n$st');
+      rethrow;
     } finally {
       _initialising = false;
     }
+  }
+
+  int _lastLoggedPct = -1;
+
+  // ── Perf levers (flip these per device, with caution) ──────────────────
+  //
+  //  * _useNpu: requires Qualcomm QNN / Google Tensor / MediaTek dispatch
+  //    libs to be present. Most mid-range Android phones lack them; the
+  //    plugin won't throw on absence, it just logs "No dispatch library
+  //    found" and silently keeps NPU as the preferred backend — which then
+  //    causes a hard crash mid-init. Only enable on a device you've
+  //    confirmed has the dispatch libs (flagship SD 8 Gen 2+, Tensor G3+,
+  //    Dimensity 9200+).
+  //  * _useSpeculativeDecoding: MTP. Gives ~1.5–2× decode speedup BUT loads
+  //    a draft model alongside the main one (extra ~400–600 MB). On 4–6 GB
+  //    devices this can OOM. Safe to leave off; turn on when targeting
+  //    ≥8 GB hardware.
+  static const bool _useNpu = false;
+  static const bool _useSpeculativeDecoding = false;
+
+  Future<InferenceModel> _loadModelWithFallback() async {
+    const backend = _useNpu ? PreferredBackend.npu : PreferredBackend.gpu;
+    // ignore: avoid_print
+    print('[GemmaService] loading model: backend=$backend '
+        'speculative=$_useSpeculativeDecoding');
+    return FlutterGemma.getActiveModel(
+      preferredBackend: backend,
+      // will change later — lowered from 8192 to fit 4 GB test device.
+      // 4096 is still > the trimmed analysis prompt (~1.6–2k tokens) with
+      // generation headroom. Bump back up once we test on ≥8 GB hardware.
+      maxTokens: 4096,
+      supportImage: _supportImage,
+      enableSpeculativeDecoding: _useSpeculativeDecoding ? true : null,
+    );
   }
 
   // ─── Companion: free chat ────────────────────────────────────────────────
@@ -159,11 +235,11 @@ class GemmaService {
   ///  6. On any failure we drop into a severity-aware hardcoded response so
   ///     the patient is never left without guidance.
   ///
-  /// `frames` are JPEG-encoded bytes (one entry per frame). Pass an empty
-  /// list to fall back to text-only analysis.
+  /// Text-only: the model receives metrics + the severity-filtered exercise
+  /// library, never raw video frames. Vision tokens add ~600 prefill tokens
+  /// per frame on E2B and didn't measurably improve picks in our tests.
   Future<AnalysisResponse> analyseGait({
     required GaitMetrics metrics,
-    required List<Uint8List> frames,
     required String age,
     required String knee,
     required String lang,
@@ -203,13 +279,10 @@ class GemmaService {
         await session.addQueryChunk(
           Message.text(text: userPrompt, isUser: true),
         );
-        if (_supportImage) {
-          for (final f in frames.take(4)) {
-            await session.addQueryChunk(
-              Message.imageOnly(imageBytes: f, isUser: true),
-            );
-          }
-        }
+        // ignore: avoid_print
+        print('[GemmaService] analyseGait prefill payload (text-only): '
+            'system=${systemPrompt.length} chars, '
+            'user=${userPrompt.length} chars');
         final raw = await session.generateChatResponse();
         final text = raw is TextResponse ? raw.token : raw.toString();
         return _parseAnalysisJson(
@@ -301,29 +374,21 @@ class GemmaService {
 
   // ─── Voice / journal tool dispatch ───────────────────────────────────────
 
+  // Tool schemas are sent to the model as part of the chat prefill. Every
+  // extra token here adds latency to *every* turn — keep descriptions terse
+  // and let the system prompt cover when-to-call routing.
   static const List<Tool> _toolDefinitions = [
     Tool(
       name: 'record_pain_entry',
       description:
-          'Persist a pain journal entry. Call when the user describes pain, '
-          'aches, soreness, or a flare-up.',
+          'Log a pain entry when the user describes their current pain '
+          '(intensity 0–10 and/or body location).',
       parameters: {
         'type': 'object',
         'properties': {
-          'pain_score': {
-            'type': 'integer',
-            'minimum': 0,
-            'maximum': 10,
-            'description': '0 = no pain, 10 = worst imaginable.',
-          },
-          'location': {
-            'type': 'string',
-            'description': 'Body location, e.g. "right knee, inner side".',
-          },
-          'context': {
-            'type': 'string',
-            'description': 'Trigger, activity, or time-of-day context.',
-          },
+          'pain_score': {'type': 'integer', 'minimum': 0, 'maximum': 10},
+          'location': {'type': 'string'},
+          'context': {'type': 'string'},
         },
         'required': ['pain_score', 'location'],
       },
@@ -331,24 +396,82 @@ class GemmaService {
     Tool(
       name: 'schedule_reminder',
       description:
-          'Schedule a one-shot local notification. Use whenever the user asks '
-          'to be reminded of an exercise, medication, or appointment.',
+          'One-shot nudge N minutes from now, e.g. "remind me in 20 minutes '
+          'to ice my knee". Use ONLY for relative "in N minutes" requests, '
+          'not daily routines (use add_medication) and not appointments '
+          '(use add_appointment).',
       parameters: {
         'type': 'object',
         'properties': {
           'title': {'type': 'string'},
           'body': {'type': 'string'},
-          'in_minutes': {
-            'type': 'integer',
-            'minimum': 1,
-            'maximum': 60 * 24 * 30,
-            'description': 'Minutes from now to fire the reminder.',
-          },
+          'in_minutes': {'type': 'integer', 'minimum': 1},
         },
         'required': ['title', 'in_minutes'],
       },
     ),
+    Tool(
+      name: 'add_medication',
+      description:
+          'Daily recurring medication reminder at a fixed time of day. '
+          'Use when the user wants a routine like "every day at 10:35" '
+          'or "remind me to take X at 8am". hour+minute are 24h.',
+      parameters: {
+        'type': 'object',
+        'properties': {
+          'name': {'type': 'string'},
+          'dose': {'type': 'string'},
+          'hour': {'type': 'integer', 'minimum': 0, 'maximum': 23},
+          'minute': {'type': 'integer', 'minimum': 0, 'maximum': 59},
+        },
+        'required': ['name', 'hour', 'minute'],
+      },
+    ),
+    Tool(
+      name: 'add_appointment',
+      description:
+          'Single upcoming doctor / physio / scan visit. when_iso must be '
+          'an absolute ISO-8601 datetime in the future. Notifies 1h before.',
+      parameters: {
+        'type': 'object',
+        'properties': {
+          'title': {'type': 'string'},
+          'when_iso': {
+            'type': 'string',
+            'description': 'Absolute ISO-8601 datetime.',
+          },
+          'location': {'type': 'string'},
+        },
+        'required': ['title', 'when_iso'],
+      },
+    ),
+    Tool(
+      name: 'list_medications',
+      description:
+          'Return the user\'s active daily medication reminders. Use when '
+          'they ask what meds they take or what is scheduled.',
+      parameters: {'type': 'object', 'properties': {}},
+    ),
+    Tool(
+      name: 'list_appointments',
+      description:
+          'Return upcoming appointments. Use when they ask about their next '
+          'visit / doctor / physio.',
+      parameters: {'type': 'object', 'properties': {}},
+    ),
   ];
+
+  /// Tools whose `acknowledgement` string is already user-ready. After these
+  /// fire we skip the second model round-trip (the model would otherwise
+  /// spend 10–15s paraphrasing the same sentence). The tool response is still
+  /// buffered into the chat so the next user turn has full context — we just
+  /// don't pay for a follow-up generation.
+  static const _terminalAckTools = {
+    'record_pain_entry',
+    'schedule_reminder',
+    'add_medication',
+    'add_appointment',
+  };
 
   Future<String> _handleResponse(
     ModelResponse response, {
@@ -361,12 +484,24 @@ class GemmaService {
         args: response.args,
         originalUserText: originalUserText,
       );
+      // Buffer the tool response into the chat so the next user turn has
+      // full context, but skip the follow-up generate for terminal tools —
+      // their `acknowledgement` is already a complete, user-facing sentence
+      // and re-running the model to paraphrase it costs 10–15s on CPU.
       await _chat!.addQueryChunk(
         Message.toolResponse(toolName: response.name, response: toolResult),
       );
+      final ack = toolResult['acknowledgement'] as String?;
+      final ok = toolResult['ok'] == true;
+      if (ok &&
+          ack != null &&
+          ack.isNotEmpty &&
+          _terminalAckTools.contains(response.name)) {
+        return ack;
+      }
       final follow = await _chat!.generateChatResponse();
       if (follow is TextResponse) return _stripThink(follow.token);
-      return toolResult['acknowledgement'] as String? ?? '';
+      return ack ?? '';
     }
     return '';
   }
@@ -415,6 +550,106 @@ class GemmaService {
               'Reminder set for ${_formatWhen(when)}: $title.',
         };
 
+      case 'add_medication':
+        final medName = (args['name'] as String?)?.trim() ?? '';
+        if (medName.isEmpty) {
+          return {'ok': false, 'error': 'name_required'};
+        }
+        final dose = (args['dose'] as String?)?.trim() ?? '';
+        final hour = ((args['hour'] as num?)?.toInt() ?? 8).clamp(0, 23);
+        final minute = ((args['minute'] as num?)?.toInt() ?? 0).clamp(0, 59);
+        final notes = (args['notes'] as String?)?.trim();
+        final now = DateTime.now();
+        final medId = now.millisecondsSinceEpoch ~/ 1000 & 0x7fffffff;
+        final med = Medication(
+          id: medId,
+          name: medName,
+          dose: dose,
+          hour: hour,
+          minute: minute,
+          createdAt: now,
+          notes: (notes == null || notes.isEmpty) ? null : notes,
+        );
+        await StorageService.saveMedication(med);
+        await NotificationService.scheduleDaily(
+          id: medId,
+          title: 'Time for $medName',
+          body: dose.isEmpty ? 'Daily reminder' : 'Take $dose',
+          hour: hour,
+          minute: minute,
+        );
+        return {
+          'ok': true,
+          'acknowledgement':
+              'Daily reminder set for $medName at ${med.timeLabel}.',
+        };
+
+      case 'add_appointment':
+        final apptTitle =
+            (args['title'] as String?)?.trim() ?? 'Appointment';
+        final iso = (args['when_iso'] as String?)?.trim() ?? '';
+        DateTime? whenAppt;
+        try {
+          whenAppt = DateTime.parse(iso);
+        } catch (_) {
+          whenAppt = null;
+        }
+        if (whenAppt == null || whenAppt.isBefore(DateTime.now())) {
+          return {
+            'ok': false,
+            'error': 'invalid_or_past_datetime',
+            'acknowledgement':
+                'I need a future date and time for that appointment. Could you say it again?',
+          };
+        }
+        final apptLoc = (args['location'] as String?)?.trim();
+        final apptNotes = (args['notes'] as String?)?.trim();
+        final apptId =
+            whenAppt.millisecondsSinceEpoch ~/ 1000 & 0x7fffffff;
+        final appt = Appointment(
+          id: apptId,
+          title: apptTitle,
+          when: whenAppt,
+          createdAt: DateTime.now(),
+          location: (apptLoc == null || apptLoc.isEmpty) ? null : apptLoc,
+          notes: (apptNotes == null || apptNotes.isEmpty) ? null : apptNotes,
+        );
+        await StorageService.saveAppointment(appt);
+        final notifyAt = whenAppt.subtract(const Duration(hours: 1));
+        if (notifyAt.isAfter(DateTime.now())) {
+          await NotificationService.scheduleReminder(
+            id: apptId,
+            title: 'Upcoming: $apptTitle',
+            body: apptLoc == null || apptLoc.isEmpty
+                ? 'In 1 hour'
+                : 'In 1 hour at $apptLoc',
+            when: notifyAt,
+          );
+        }
+        return {
+          'ok': true,
+          'acknowledgement':
+              'Saved: $apptTitle on ${_formatDate(whenAppt)} at '
+              '${_formatWhen(whenAppt)}.',
+        };
+
+      case 'list_medications':
+        final meds = StorageService.allMedications();
+        return {
+          'ok': true,
+          'count': meds.length,
+          'medications': [for (final m in meds) m.toJson()],
+        };
+
+      case 'list_appointments':
+        final appts = StorageService.upcomingAppointments();
+        return {
+          'ok': true,
+          'count': appts.length,
+          'now': DateTime.now().toIso8601String(),
+          'appointments': [for (final a in appts) a.toJson()],
+        };
+
       default:
         return {'ok': false, 'error': 'unknown_tool:$name'};
     }
@@ -447,14 +682,28 @@ class GemmaService {
     // 3. Strip C/JS line comments — sometimes the model emits "// note".
     body = body.replaceAll(RegExp(r'//[^\n]*'), '');
 
-    // 4. Collapse orphan commas — `, ,` or a comma on its own line between
+    // 4. Repair array elements with a missing opening quote — on-device Gemma
+    //    sometimes drops the leading `"` on items 2+ of a JSON array, e.g.
+    //      [
+    //        "first",
+    //        Second item.",          ← missing leading "
+    //        Third item."
+    //      ]
+    //    Pattern: after `,` or `[`, optional whitespace/newline, a letter,
+    //    then content ending in `",` or `"\n`/`"\s*]`. We re-insert the `"`.
+    body = body.replaceAllMapped(
+      RegExp(r'([,\[])(\s*\n\s*)([A-Za-z][^"\n]*?")(\s*[,\]\n])'),
+      (m) => '${m[1]}${m[2]}"${m[3]}${m[4]}',
+    );
+
+    // 5. Collapse orphan commas — `, ,` or a comma on its own line between
     //    a value and the next key. Also handle the on-device-Gemma quirk
     //    where it emits a stray empty/garbage token between fields, e.g.
     //    `"k": "v",  " ,\n  "next": ...` (an unterminated phantom string).
     //    We drop any `"..."` token that sits between a `,` and a `,`/`"key":`.
     body = body.replaceAll(RegExp(r',\s*"[^"\n]*"\s*,'), ',');
     body = body.replaceAll(RegExp(r',\s*,'), ',');
-    body = body.replaceAll(RegExp(r',\s*([}\]])'), r'$1');
+    body = body.replaceAllMapped(RegExp(r',\s*([}\]])'), (m) => m[1]!);
 
     // 5. If the model was truncated, jsonDecode will throw. Walk the string
     //    and close any open " then any open [ / { in reverse order.
@@ -503,7 +752,7 @@ class GemmaService {
       for (final open in stack.reversed) {
         candidate += open == '{' ? '}' : ']';
       }
-      candidate = candidate.replaceAll(RegExp(r',\s*([}\]])'), r'$1');
+      candidate = candidate.replaceAllMapped(RegExp(r',\s*([}\]])'), (m) => m[1]!);
       return tryDecode(candidate);
     }
   }
@@ -524,6 +773,13 @@ class GemmaService {
 
   String _formatWhen(DateTime t) =>
       '${t.hour.toString().padLeft(2, '0')}:${t.minute.toString().padLeft(2, '0')}';
+
+  static const _months = [
+    'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+    'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec',
+  ];
+
+  String _formatDate(DateTime t) => '${_months[t.month - 1]} ${t.day}';
 
   AnalysisResponse _parseAnalysisJson({
     required String raw,

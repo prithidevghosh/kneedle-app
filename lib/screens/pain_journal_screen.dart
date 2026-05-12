@@ -96,7 +96,7 @@ class _PainJournalScreenState extends ConsumerState<PainJournalScreen> {
             const SizedBox(height: KneedleTheme.space5),
             Center(
               child: KMicButton(
-                listening: _busy,
+                state: _busy ? KMicState.processing : KMicState.idle,
                 onTap: _busy ? () {} : _record,
               ),
             ),

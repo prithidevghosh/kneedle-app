@@ -1,14 +1,13 @@
 import 'dart:async';
-import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_pose_detection/flutter_pose_detection.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:path_provider/path_provider.dart';
 import 'package:speech_to_text/speech_to_text.dart';
 
+import '../clinical/severity.dart';
 import '../core/theme.dart';
 import '../gait/landmark.dart' as gait;
 import '../models/gait_session.dart';
@@ -26,16 +25,6 @@ enum _Phase {
   failed,
 }
 
-/// One captured frame: JPEG bytes + the path we wrote it to (used to feed
-/// `flutter_pose_detection.detectPoseFromFile`). Bytes are kept in-memory so
-/// we can ship up to 4 of them to Gemma's multimodal input.
-class _Shot {
-  _Shot(this.path, this.bytes, this.atMs);
-  final String path;
-  final Uint8List bytes;
-  final int atMs;
-}
-
 class GaitCaptureScreen extends ConsumerStatefulWidget {
   const GaitCaptureScreen({super.key, this.lang = 'en', this.age = 'unknown', this.knee = 'right'});
   final String lang;
@@ -47,8 +36,7 @@ class GaitCaptureScreen extends ConsumerStatefulWidget {
 }
 
 class _GaitCaptureScreenState extends ConsumerState<GaitCaptureScreen> {
-  static const _captureSeconds = 5;
-  static const _captureIntervalMs = 250;
+  static const _captureSeconds = 8;
 
   CameraController? _camera;
   final NpuPoseDetector _pose = NpuPoseDetector();
@@ -62,9 +50,26 @@ class _GaitCaptureScreenState extends ConsumerState<GaitCaptureScreen> {
   int _countdown = 3;
   String _status = 'Setting up camera…';
   String? _error;
+  bool _canRetry = false;
 
-  final List<_Shot> _frontalShots = [];
-  final List<_Shot> _sagittalShots = [];
+  // Streaming-capture state. Pose detection runs inline inside the camera's
+  // image-stream callback rather than after the fact on JPEGs, so the lists
+  // below hold already-extracted pose frames instead of raw shots.
+  //
+  //  * _captureActive — gate on the callback so frames after stopImageStream
+  //    or before startImageStream don't accumulate.
+  //  * _isProcessingFrame — semaphore preventing reentry. The camera plugin
+  //    delivers frames at ~30 fps; pose inference runs at ~10 fps. When the
+  //    detector is busy we drop the incoming frame (camera plugin policy).
+  //  * _captureStartedAt — wall-clock reference so each PoseFrame.timeSec is
+  //    computed against the recording start, not the absolute clock.
+  //  * _frameSeq — monotonic frame index for `PoseFrame.frameIdx`.
+  final List<gait.PoseFrame> _frontalShots = [];
+  final List<gait.PoseFrame> _sagittalShots = [];
+  bool _captureActive = false;
+  bool _isProcessingFrame = false;
+  DateTime? _captureStartedAt;
+  int _frameSeq = 0;
 
   @override
   void initState() {
@@ -99,6 +104,11 @@ class _GaitCaptureScreenState extends ConsumerState<GaitCaptureScreen> {
         front,
         ResolutionPreset.medium,
         enableAudio: false,
+        // Required for startImageStream: the camera plugin only delivers raw
+        // YUV planes when an explicit format group is requested. On iOS this
+        // is silently translated to bgra8888 (the plugin can't honour YUV
+        // there) — handled inside the per-frame callback.
+        imageFormatGroup: ImageFormatGroup.yuv420,
       );
       await ctrl.initialize();
       if (!mounted) {
@@ -197,7 +207,13 @@ class _GaitCaptureScreenState extends ConsumerState<GaitCaptureScreen> {
     }
   }
 
-  Future<void> _runCapture(List<_Shot> sink, _Phase phase) async {
+  /// Capture phase using `CameraController.startImageStream`. Pose extraction
+  /// runs inline inside the per-frame callback so we accumulate
+  /// `gait.PoseFrame`s directly — no JPEG round-trip, no temp-file writes,
+  /// no post-capture pose batch. Hard ceiling lifted from ~10 frames per 5s
+  /// (takePicture-bound) to whatever the pose detector can sustain (~10-15
+  /// fps on this device → 50-75 usable samples per phase).
+  Future<void> _runCapture(List<gait.PoseFrame> sink, _Phase phase) async {
     _wakeActive = false;
     await _stt.stop();
     setState(() => _phase = phase);
@@ -212,28 +228,253 @@ class _GaitCaptureScreenState extends ConsumerState<GaitCaptureScreen> {
           : 'Recording sagittal walk…';
     });
 
-    final dir = await getTemporaryDirectory();
-    final t0 = DateTime.now();
-    final deadline = t0.add(const Duration(seconds: _captureSeconds));
-    var i = 0;
-    while (DateTime.now().isBefore(deadline)) {
+    // Pose detector must be ready before we start the stream — the first
+    // few frames would otherwise be silently dropped on the platform side.
+    // Almost always already done by the time we get here.
+    if (_poseReady != null) await _poseReady;
+
+    _frameSeq = 0;
+    _isProcessingFrame = false;
+    _captureStartedAt = DateTime.now();
+    _captureActive = true;
+    _resetStreamCounters();
+
+    try {
+      // The camera-plugin listener signature is void(CameraImage), so we
+      // can't `await` the async handler here. The plugin will simply drop
+      // further frames while `_isProcessingFrame == true`, which is the
+      // backpressure mechanism we want — pose runs serially, camera supplies
+      // at native FPS, mismatch resolved by dropping rather than queueing.
+      await _camera!.startImageStream((image) {
+        _onCameraFrame(image, sink);
+      });
+      await Future.delayed(const Duration(seconds: _captureSeconds));
+    } finally {
+      _captureActive = false;
       try {
-        final pic = await _camera!.takePicture();
-        final bytes = await File(pic.path).readAsBytes();
-        final dst = File('${dir.path}/${phase.name}_$i.jpg');
-        await dst.writeAsBytes(bytes, flush: true);
-        sink.add(_Shot(
-          dst.path,
-          bytes,
-          DateTime.now().difference(t0).inMilliseconds,
-        ));
-        i++;
+        await _camera?.stopImageStream();
       } catch (_) {
-        // skip frame on transient camera error
+        // Stream already stopped (e.g. controller disposed) — nothing to do.
       }
-      // throttle: takePicture itself is slow; only wait the residual.
-      await Future.delayed(const Duration(milliseconds: _captureIntervalMs));
+      // Drain: an in-flight processFrame may still be settling. Wait briefly
+      // so the caller sees a fully-populated sink. The pose detector takes
+      // <120ms per frame on this hardware, so a 400ms budget is safe.
+      final flushDeadline =
+          DateTime.now().add(const Duration(milliseconds: 400));
+      while (_isProcessingFrame && DateTime.now().isBefore(flushDeadline)) {
+        await Future.delayed(const Duration(milliseconds: 20));
+      }
+      _captureStartedAt = null;
+      _logStreamSummary(phase, sink.length);
     }
+  }
+
+  // Diagnostic counters: surfaced once per phase via the [_streamSummary] log
+  // so we can tell at a glance how the stream pipeline is behaving — how many
+  // frames the camera actually delivered, how many were dropped to the busy
+  // semaphore, how many failed pose extraction, and the first observed image
+  // format/dimensions/rotation triple. Reset at the start of each phase.
+  int _framesDelivered = 0;
+  int _framesDroppedBusy = 0;
+  int _framesErrored = 0;
+  String? _firstFrameSummary;
+  String? _firstErrorSummary;
+
+  /// Per-frame handler driven by `startImageStream`. Skips reentry while
+  /// pose is busy, marshals the CameraImage planes into the plugin's expected
+  /// shape, then appends a `gait.PoseFrame` to [sink].
+  ///
+  /// Errors are caught and counted rather than thrown — one bad frame must
+  /// not abort a recording — but the first error of a run is captured with
+  /// full type + message so the post-phase summary log can surface it.
+  Future<void> _onCameraFrame(
+    CameraImage image,
+    List<gait.PoseFrame> sink,
+  ) async {
+    if (!_captureActive) return;
+    _framesDelivered++;
+    if (_isProcessingFrame) {
+      _framesDroppedBusy++;
+      return;
+    }
+    final startedAt = _captureStartedAt;
+    if (startedAt == null) return;
+    _isProcessingFrame = true;
+    final idx = _frameSeq++;
+    final tMs = DateTime.now().difference(startedAt).inMilliseconds;
+    try {
+      // The pose plugin's native YUV→Bitmap converter assumes tightly-packed
+      // planes: Y of length width*height, U/V each of length width*height/4,
+      // pixelStride=1. On most modern Android devices the camera plugin
+      // delivers stride-padded Y (e.g. 720×768 for a 720×480 frame) and
+      // chroma with pixelStride=2 (NV21 layout exposed as two planes). The
+      // plugin's converter then offsets into a 518400-byte NV21 buffer using
+      // the padded yPlane.size and walks straight off the end. Repacking in
+      // Dart sidesteps the bug: we copy each row honouring rowStride, drop
+      // the trailing padding, and de-interleave U/V honouring pixelStride.
+      // Cost is one full O(width*height) pass per frame ≈ 1-3 ms — well
+      // inside the 100 ms budget per frame.
+      final isYuv = image.format.group == ImageFormatGroup.yuv420;
+      final planes = isYuv
+          ? _repackYuv420(image)
+          : [
+              for (final p in image.planes)
+                {
+                  'bytes': p.bytes,
+                  'bytesPerRow': p.bytesPerRow,
+                  'bytesPerPixel': p.bytesPerPixel ?? 1,
+                },
+            ];
+      final format = isYuv ? 'yuv420' : 'bgra8888';
+      final rotation = _camera?.description.sensorOrientation ?? 0;
+      _firstFrameSummary ??= 'format=$format, '
+          '${image.width}x${image.height}, '
+          'planes=${planes.length}, rotation=$rotation, '
+          'firstPlaneBytes=${planes.first['bytes'] is Iterable ? (planes.first['bytes'] as dynamic).length : '?'}';
+      final result = await _pose.processFrame(
+        planes: planes,
+        width: image.width,
+        height: image.height,
+        format: format,
+        rotation: rotation,
+      );
+      final pose = result.firstPose;
+      final landmarks = pose == null
+          ? null
+          : [
+              for (final lm in pose.landmarks)
+                gait.Landmark(
+                  x: lm.x,
+                  y: lm.y,
+                  z: lm.z,
+                  visibility: lm.visibility,
+                ),
+            ];
+      double confidence = 0;
+      if (landmarks != null) {
+        double meanVis(int a, int b, int c) =>
+            (landmarks[a].visibility +
+                landmarks[b].visibility +
+                landmarks[c].visibility) /
+            3.0;
+        final r = meanVis(
+            gait.Lm.rightHip, gait.Lm.rightKnee, gait.Lm.rightAnkle);
+        final l =
+            meanVis(gait.Lm.leftHip, gait.Lm.leftKnee, gait.Lm.leftAnkle);
+        confidence = r > l ? r : l;
+      }
+      // Keep null-landmark frames too: the pipeline's `framesSkipped`
+      // accounting and diagnostics rely on seeing the full denominator.
+      sink.add(gait.PoseFrame(
+        frameIdx: idx,
+        sampledIdx: sink.length,
+        timeSec: tMs / 1000.0,
+        landmarks: landmarks,
+        confidence: confidence,
+      ));
+    } catch (e, st) {
+      _framesErrored++;
+      // For DetectionError specifically, the actual Android-side cause sits
+      // in `platformMessage` — the public toString hides it. Use dynamic
+      // access so we don't have to import the plugin's private error type.
+      String? platformMsg;
+      try {
+        platformMsg = (e as dynamic).platformMessage as String?;
+      } catch (_) {/* not a DetectionError */}
+      _firstErrorSummary ??= '${e.runtimeType}: $e'
+          '${platformMsg == null ? "" : " | platformMessage=$platformMsg"}'
+          '\n${st.toString().split('\n').take(3).join(' | ')}';
+    } finally {
+      _isProcessingFrame = false;
+    }
+  }
+
+  /// Convert a CameraImage's YUV_420_888 planes (with arbitrary row stride
+  /// and chroma pixel stride) into the tightly-packed three-plane layout the
+  /// `flutter_pose_detection` Android converter expects:
+  ///
+  ///   * Y plane: `width * height` bytes, no padding, pixelStride=1.
+  ///   * U plane: `(width/2) * (height/2)` bytes, no padding, pixelStride=1.
+  ///   * V plane: same shape as U.
+  ///
+  /// The native side then concatenates these in NV21 order via its (broken)
+  /// arithmetic, but with our packed inputs that arithmetic now lands inside
+  /// the buffer and produces a correct image. See callsite for the full
+  /// rationale.
+  List<Map<String, dynamic>> _repackYuv420(CameraImage image) {
+    final width = image.width;
+    final height = image.height;
+    final yPlane = image.planes[0];
+    final uPlane = image.planes[1];
+    final vPlane = image.planes[2];
+
+    // Y: copy each row, taking exactly `width` bytes and skipping any row
+    // padding. Bulk-copy fast path when there's no padding to skip.
+    final yOut = Uint8List(width * height);
+    if (yPlane.bytesPerRow == width) {
+      yOut.setRange(0, width * height, yPlane.bytes);
+    } else {
+      for (var row = 0; row < height; row++) {
+        final src = row * yPlane.bytesPerRow;
+        yOut.setRange(row * width, (row + 1) * width, yPlane.bytes, src);
+      }
+    }
+
+    // U / V: half resolution. pixelStride may be 1 (planar) or 2 (chroma
+    // semi-planar exposed as two planes — common on Android). The two-plane
+    // pixelStride=2 case is the NV21/NV12 layout where U and V interleave
+    // in the same underlying buffer.
+    final uvWidth = width ~/ 2;
+    final uvHeight = height ~/ 2;
+    final uOut = Uint8List(uvWidth * uvHeight);
+    final vOut = Uint8List(uvWidth * uvHeight);
+    final uPx = uPlane.bytesPerPixel ?? 1;
+    final vPx = vPlane.bytesPerPixel ?? 1;
+
+    final uBytes = uPlane.bytes;
+    final vBytes = vPlane.bytes;
+    final uStride = uPlane.bytesPerRow;
+    final vStride = vPlane.bytesPerRow;
+    final uLen = uBytes.length;
+    final vLen = vBytes.length;
+
+    for (var row = 0; row < uvHeight; row++) {
+      final uRow = row * uStride;
+      final vRow = row * vStride;
+      final outRow = row * uvWidth;
+      for (var col = 0; col < uvWidth; col++) {
+        final uIdx = uRow + col * uPx;
+        final vIdx = vRow + col * vPx;
+        // Bounds-guard the last pixel of NV21-style interleaved chroma —
+        // V plane is typically one byte shorter than the index would
+        // suggest because it ends at the second-to-last interleaved byte.
+        uOut[outRow + col] = uIdx < uLen ? uBytes[uIdx] : 0;
+        vOut[outRow + col] = vIdx < vLen ? vBytes[vIdx] : 0;
+      }
+    }
+
+    return [
+      {'bytes': yOut, 'bytesPerRow': width, 'bytesPerPixel': 1},
+      {'bytes': uOut, 'bytesPerRow': uvWidth, 'bytesPerPixel': 1},
+      {'bytes': vOut, 'bytesPerRow': uvWidth, 'bytesPerPixel': 1},
+    ];
+  }
+
+  void _resetStreamCounters() {
+    _framesDelivered = 0;
+    _framesDroppedBusy = 0;
+    _framesErrored = 0;
+    _firstFrameSummary = null;
+    _firstErrorSummary = null;
+  }
+
+  void _logStreamSummary(_Phase phase, int sinkLen) {
+    // ignore: avoid_print
+    print('[GaitCapture] ${phase.name} stream summary: '
+        'delivered=$_framesDelivered, droppedBusy=$_framesDroppedBusy, '
+        'errored=$_framesErrored, sinkLen=$sinkLen, '
+        'firstFrame=${_firstFrameSummary ?? "<none — callback never fired>"}'
+        '${_firstErrorSummary == null ? "" : ", firstError=$_firstErrorSummary"}');
   }
 
   Future<void> _startFlow() async {
@@ -272,94 +513,85 @@ class _GaitCaptureScreenState extends ConsumerState<GaitCaptureScreen> {
     }
   }
 
-  Future<List<gait.PoseFrame>> _runPoseOn(List<_Shot> shots) async {
-    final frames = <gait.PoseFrame>[];
-    for (var idx = 0; idx < shots.length; idx++) {
-      final s = shots[idx];
-      try {
-        final result = await _pose.detectPoseFromFile(s.path);
-        final p = result.firstPose;
-        final landmarks = p == null
-            ? null
-            : [
-                for (final lm in p.landmarks)
-                  gait.Landmark(
-                    x: lm.x,
-                    y: lm.y,
-                    z: lm.z,
-                    visibility: lm.visibility,
-                  ),
-              ];
-        double confidence = 0;
-        if (landmarks != null) {
-          double mean(int a, int b, int c) =>
-              (landmarks[a].visibility +
-                  landmarks[b].visibility +
-                  landmarks[c].visibility) /
-              3.0;
-          final r = mean(gait.Lm.rightHip, gait.Lm.rightKnee, gait.Lm.rightAnkle);
-          final l = mean(gait.Lm.leftHip, gait.Lm.leftKnee, gait.Lm.leftAnkle);
-          confidence = r > l ? r : l;
-        }
-        frames.add(gait.PoseFrame(
-          frameIdx: idx,
-          sampledIdx: idx,
-          timeSec: s.atMs / 1000.0,
-          landmarks: landmarks,
-          confidence: confidence,
-        ));
-      } catch (_) {
-        frames.add(gait.PoseFrame(
-          frameIdx: idx,
-          sampledIdx: idx,
-          timeSec: s.atMs / 1000.0,
-          landmarks: null,
-          confidence: 0,
-        ));
-      }
-    }
-    return frames;
+
+  void _restartCapture() {
+    setState(() {
+      _frontalShots.clear();
+      _sagittalShots.clear();
+      _error = null;
+      _canRetry = false;
+      _phase = _Phase.prepFrontal;
+      _status = 'Walk TOWARD the camera (frontal). Tap start when ready.';
+    });
   }
 
   Future<void> _analyse() async {
     setState(() {
       _phase = _Phase.analysing;
-      _status = 'Detecting pose in captured frames…';
+      _status = 'Computing gait metrics…';
     });
+    final total = Stopwatch()..start();
     try {
-      // Ensure the background pose init finished. Almost always already done
-      // by the time captures end (≥10s elapsed), but await for safety.
-      if (_poseReady != null) await _poseReady;
-      final frontalFrames = await _runPoseOn(_frontalShots);
-      final sagittalFrames = await _runPoseOn(_sagittalShots);
-      final fps = 1000.0 / _captureIntervalMs;
+      // Pose extraction now runs inline during streaming capture — the lists
+      // already carry `PoseFrame`s with landmarks. The standalone batch step
+      // (the old `_runPoseOn`) is gone, and with it the post-capture wait.
+      //
+      // Effective fps is computed from the *achieved* sample count over the
+      // 5-second capture window rather than a hardcoded interval, because
+      // streaming throughput depends on pose-inference latency. The gait
+      // pipeline's `targetSampleFps = 30` subsampling clamps to ≥1, so any
+      // achieved fps from ~5 to ~30 results in no further subsampling.
+      final frontalFps = _frontalShots.length / _captureSeconds;
+      final sagittalFps = _sagittalShots.length / _captureSeconds;
+      final fps =
+          (frontalFps > sagittalFps ? frontalFps : sagittalFps).clamp(1.0, 60.0);
 
-      setState(() => _status = 'Computing gait metrics…');
+      final metricsSw = Stopwatch()..start();
       final gaitResult = await ref.read(gaitServiceProvider).analyseFrames(
-            frontalFrames: frontalFrames,
-            sagittalFrames: sagittalFrames,
+            frontalFrames: _frontalShots,
+            sagittalFrames: _sagittalShots,
             fps: fps,
           );
+      metricsSw.stop();
+
+      // Gate the expensive LLM call. If the pose pipeline could not extract a
+      // bilateral signal (one leg out of frame, too few usable frames, etc.)
+      // we'd otherwise hand Gemma a payload full of "not detected" fields and
+      // burn minutes of decode for a response we couldn't trust.
+      final insufficient = validateMetricsForAnalysis(gaitResult.metrics);
+      if (insufficient != null) {
+        // ignore: avoid_print
+        print('[GaitCapture] metrics insufficient, skipping LLM: '
+            '$insufficient');
+        if (!mounted) return;
+        setState(() {
+          _phase = _Phase.failed;
+          _error = insufficient;
+          _canRetry = true;
+        });
+        return;
+      }
 
       setState(() => _status = 'Asking Gemma for guidance…');
       final sessionNumber =
           ref.read(gaitSessionsProvider).length + 1;
-      // Sample up to 4 evenly-spaced frontal shots for multimodal context.
-      final pickedFrames = <Uint8List>[];
-      if (_frontalShots.isNotEmpty) {
-        final step = (_frontalShots.length / 4).ceil().clamp(1, 999);
-        for (var i = 0; i < _frontalShots.length && pickedFrames.length < 4; i += step) {
-          pickedFrames.add(_frontalShots[i].bytes);
-        }
-      }
+      final llmSw = Stopwatch()..start();
       final analysis = await ref.read(gemmaServiceProvider).analyseGait(
             metrics: gaitResult.metrics,
-            frames: pickedFrames,
             age: widget.age,
             knee: widget.knee,
             lang: widget.lang,
             sessionNumber: sessionNumber,
           );
+      llmSw.stop();
+      total.stop();
+      // ignore: avoid_print
+      print('[GaitCapture] analysis timing: '
+          'frames=${_frontalShots.length}+${_sagittalShots.length} '
+          '(@${fps.toStringAsFixed(1)}fps, pose ran inline during capture), '
+          'metrics=${metricsSw.elapsedMilliseconds}ms, '
+          'llm=${llmSw.elapsedMilliseconds}ms, '
+          'total=${total.elapsedMilliseconds}ms');
 
       final session = GaitSession.fromMetrics(gaitResult.metrics);
       await StorageService.saveGaitSession(session);
@@ -420,13 +652,30 @@ class _GaitCaptureScreenState extends ConsumerState<GaitCaptureScreen> {
                   textAlign: TextAlign.center,
                   style: Theme.of(context).textTheme.bodyMedium),
               const SizedBox(height: KneedleTheme.space6),
-              SizedBox(
-                width: double.infinity,
-                child: FilledButton(
-                  onPressed: () => Navigator.of(context).pop(),
-                  child: const Text('Back'),
+              if (_canRetry) ...[
+                SizedBox(
+                  width: double.infinity,
+                  child: FilledButton(
+                    onPressed: _restartCapture,
+                    child: const Text('Record again'),
+                  ),
                 ),
-              ),
+                const SizedBox(height: KneedleTheme.space3),
+                SizedBox(
+                  width: double.infinity,
+                  child: OutlinedButton(
+                    onPressed: () => Navigator.of(context).pop(),
+                    child: const Text('Back'),
+                  ),
+                ),
+              ] else
+                SizedBox(
+                  width: double.infinity,
+                  child: FilledButton(
+                    onPressed: () => Navigator.of(context).pop(),
+                    child: const Text('Back'),
+                  ),
+                ),
             ],
           ),
         ),

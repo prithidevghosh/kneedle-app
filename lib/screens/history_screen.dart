@@ -103,7 +103,7 @@ class _HistoryScreenState extends ConsumerState<HistoryScreen> {
         return const KEmptyState(
           icon: Icons.directions_walk_rounded,
           title: 'No gait sessions yet',
-          message: 'Run your first 5-second walk to see analysis here.',
+          message: 'Run your first 8-second walk to see analysis here.',
         );
       }
       return ListView(

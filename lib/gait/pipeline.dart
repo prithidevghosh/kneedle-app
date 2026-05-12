@@ -227,6 +227,20 @@ class PoseSample {
   final minN = rN < lN ? rN : lN;
   final samplesBalanced = rN >= 10 && lN >= 10 && (minN / maxN) >= 0.4;
 
+  // Diagnostic: surface why metrics may be coming back null. The three gates
+  // most likely to drop a recording are (a) per-side sample count below 10,
+  // (b) imbalanced sides (one leg occluded), (c) frame-confidence rejection
+  // shrinking the working set. Logging counts + ratio lets the user see at a
+  // glance which gate fired without instrumenting the whole pipeline.
+  // ignore: avoid_print
+  print('[GaitPipeline] sagittal samples: right=$rN, left=$lN, '
+      'balanceRatio=${maxN == 0 ? 0 : (minN / maxN).toStringAsFixed(2)}, '
+      'samplesBalanced=$samplesBalanced  '
+      '|  frontal frames: analysed=${frontal.framesAnalyzed}, '
+      'skipped=${frontal.framesSkipped}  '
+      '|  sagittal frames: analysed=${sagittal.framesAnalyzed}, '
+      'skipped=${sagittal.framesSkipped}');
+
   double? symmetry;
   if (rAvg != 0 && lAvg != 0 && samplesBalanced) {
     symmetry = Round.r1(
@@ -296,6 +310,8 @@ class PoseSample {
         ? Round.r1((rAvg - lAvg).abs())
         : null,
     symmetryScore: symmetry,
+    toeOutAngleRight: froRes.toeOutRight,
+    toeOutAngleLeft: froRes.toeOutLeft,
     trunkLeanAngle: froRes.trunkLateralLeanDeg,
     trunkLeanDirection: froRes.trunkLeanDirection,
     cadence: params.cadence,

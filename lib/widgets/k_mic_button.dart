@@ -2,16 +2,23 @@ import 'package:flutter/material.dart';
 
 import '../core/theme.dart';
 
-/// Large circular mic button that gently "breathes" while listening.
+/// Visual states for [KMicButton]:
+///  * `idle` — sage gradient, mic icon. Tap to start listening.
+///  * `listening` — coral gradient, breathing rings. Tap to stop.
+///  * `processing` — muted ink gradient, spinner. Tap is a no-op.
+enum KMicState { idle, listening, processing }
+
+/// Large circular mic button that gently "breathes" while listening, and
+/// shows a spinner while the model is thinking.
 class KMicButton extends StatefulWidget {
   const KMicButton({
     super.key,
-    required this.listening,
+    required this.state,
     required this.onTap,
     this.size = 132,
   });
 
-  final bool listening;
+  final KMicState state;
   final VoidCallback onTap;
   final double size;
 
@@ -26,18 +33,21 @@ class _KMicButtonState extends State<KMicButton>
     duration: const Duration(milliseconds: 1600),
   );
 
+  bool get _listening => widget.state == KMicState.listening;
+  bool get _processing => widget.state == KMicState.processing;
+
   @override
   void initState() {
     super.initState();
-    if (widget.listening) _c.repeat(reverse: true);
+    if (_listening) _c.repeat(reverse: true);
   }
 
   @override
   void didUpdateWidget(covariant KMicButton old) {
     super.didUpdateWidget(old);
-    if (widget.listening && !_c.isAnimating) {
+    if (_listening && !_c.isAnimating) {
       _c.repeat(reverse: true);
-    } else if (!widget.listening && _c.isAnimating) {
+    } else if (!_listening && _c.isAnimating) {
       _c.stop();
       _c.value = 0;
     }
@@ -52,20 +62,28 @@ class _KMicButtonState extends State<KMicButton>
   @override
   Widget build(BuildContext context) {
     return GestureDetector(
-      onTap: widget.onTap,
+      onTap: _processing ? null : widget.onTap,
       child: AnimatedBuilder(
         animation: _c,
         builder: (_, __) {
           final t = Curves.easeInOut.transform(_c.value);
-          final color =
-              widget.listening ? KneedleTheme.coral : KneedleTheme.sage;
+          final color = _listening
+              ? KneedleTheme.coral
+              : _processing
+                  ? KneedleTheme.inkMuted
+                  : KneedleTheme.sage;
+          final gradient = _listening
+              ? const [KneedleTheme.coral, Color(0xFFB45A3D)]
+              : _processing
+                  ? const [KneedleTheme.inkMuted, KneedleTheme.ink]
+                  : const [KneedleTheme.sage, KneedleTheme.sageDeep];
           return SizedBox(
             width: widget.size + 60,
             height: widget.size + 60,
             child: Stack(
               alignment: Alignment.center,
               children: [
-                if (widget.listening) ...[
+                if (_listening) ...[
                   _ring(widget.size + 24 + t * 30,
                       color.withValues(alpha: 0.10 * (1 - t))),
                   _ring(widget.size + 8 + t * 24,
@@ -79,9 +97,7 @@ class _KMicButtonState extends State<KMicButton>
                     gradient: LinearGradient(
                       begin: Alignment.topLeft,
                       end: Alignment.bottomRight,
-                      colors: widget.listening
-                          ? const [KneedleTheme.coral, Color(0xFFB45A3D)]
-                          : const [KneedleTheme.sage, KneedleTheme.sageDeep],
+                      colors: gradient,
                     ),
                     boxShadow: [
                       BoxShadow(
@@ -93,11 +109,23 @@ class _KMicButtonState extends State<KMicButton>
                     ],
                   ),
                   alignment: Alignment.center,
-                  child: Icon(
-                    widget.listening ? Icons.graphic_eq : Icons.mic_rounded,
-                    color: Colors.white,
-                    size: widget.size * 0.36,
-                  ),
+                  child: _processing
+                      ? SizedBox(
+                          width: widget.size * 0.42,
+                          height: widget.size * 0.42,
+                          child: const CircularProgressIndicator(
+                            strokeWidth: 3.5,
+                            valueColor:
+                                AlwaysStoppedAnimation<Color>(Colors.white),
+                          ),
+                        )
+                      : Icon(
+                          _listening
+                              ? Icons.stop_rounded
+                              : Icons.mic_rounded,
+                          color: Colors.white,
+                          size: widget.size * 0.36,
+                        ),
                 ),
               ],
             ),

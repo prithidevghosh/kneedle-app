@@ -18,6 +18,8 @@ class FrontalResult {
     required this.stepWidthProxy,
     required this.fppaRight,
     required this.fppaLeft,
+    required this.toeOutRight,
+    required this.toeOutLeft,
     required this.hsRightFrontal,
     required this.hsLeftFrontal,
     required this.phaseRightFrontal,
@@ -34,6 +36,8 @@ class FrontalResult {
   final double stepWidthProxy;
   final double fppaRight;
   final double fppaLeft;
+  final double? toeOutRight;
+  final double? toeOutLeft;
   final List<int> hsRightFrontal;
   final List<int> hsLeftFrontal;
   final Map<int, String> phaseRightFrontal;
@@ -50,6 +54,8 @@ class FrontalResult {
     stepWidthProxy: 0,
     fppaRight: 0,
     fppaLeft: 0,
+    toeOutRight: null,
+    toeOutLeft: null,
     hsRightFrontal: const [],
     hsLeftFrontal: const [],
     phaseRightFrontal: const {},
@@ -121,6 +127,12 @@ FrontalResult extractFrontal(
   final staticAlignL = <double>[];
   final fppaR = <double>[];
   final fppaL = <double>[];
+  final toeOutR = <double>[];
+  final toeOutL = <double>[];
+  var toeOutRStance = 0;
+  var toeOutLStance = 0;
+  var toeOutRVis = 0;
+  var toeOutLVis = 0;
   final pelvicRMs = <double>[];
   final pelvicLMs = <double>[];
   final trunkLat = <double>[];
@@ -176,16 +188,51 @@ FrontalResult extractFrontal(
       }
     }
 
+    final rStance = phaseRf[si] == 'loading_response' ||
+        phaseRf[si] == 'mid_stance' ||
+        phaseRf[si] == 'terminal_stance';
+    final lStance = phaseLf[si] == 'loading_response' ||
+        phaseLf[si] == 'mid_stance' ||
+        phaseLf[si] == 'terminal_stance';
+
     if (frontalAligned && phaseRf[si] == 'mid_stance') {
       if (lm[Lm.leftHip].visibility > GaitConst.minLandmarkVis &&
           lm[Lm.rightHip].visibility > GaitConst.minLandmarkVis) {
         pelvicRMs.add(pelvicObliquity(lm[Lm.leftHip], lm[Lm.rightHip]));
       }
     }
+    if (frontalAligned && rStance) {
+      toeOutRStance++;
+      if (lm[Lm.rightHeel].visibility > GaitConst.minLandmarkVis &&
+          lm[Lm.rightFootIndex].visibility > GaitConst.minLandmarkVis) {
+        toeOutRVis++;
+        final heel = lm[Lm.rightHeel];
+        final toe = lm[Lm.rightFootIndex];
+        final dx = toe.x - heel.x;
+        final dy = (toe.y - heel.y).abs();
+        if (dy > 1e-4) {
+          toeOutR.add(math.atan2(dx, dy) * 180.0 / math.pi);
+        }
+      }
+    }
     if (frontalAligned && phaseLf[si] == 'mid_stance') {
       if (lm[Lm.leftHip].visibility > GaitConst.minLandmarkVis &&
           lm[Lm.rightHip].visibility > GaitConst.minLandmarkVis) {
         pelvicLMs.add(pelvicObliquity(lm[Lm.leftHip], lm[Lm.rightHip]));
+      }
+    }
+    if (frontalAligned && lStance) {
+      toeOutLStance++;
+      if (lm[Lm.leftHeel].visibility > GaitConst.minLandmarkVis &&
+          lm[Lm.leftFootIndex].visibility > GaitConst.minLandmarkVis) {
+        toeOutLVis++;
+        final heel = lm[Lm.leftHeel];
+        final toe = lm[Lm.leftFootIndex];
+        final dx = heel.x - toe.x;
+        final dy = (toe.y - heel.y).abs();
+        if (dy > 1e-4) {
+          toeOutL.add(math.atan2(dx, dy) * 180.0 / math.pi);
+        }
       }
     }
 
@@ -232,6 +279,11 @@ FrontalResult extractFrontal(
   double fppaDev(List<double> v) =>
       v.isEmpty ? 0.0 : Round.r1((180.0 - mean(v)).abs());
 
+  // ignore: avoid_print
+  print('[frontal] toeOut diagnostic: '
+      'R stance=$toeOutRStance vis=$toeOutRVis samples=${toeOutR.length}  '
+      'L stance=$toeOutLStance vis=$toeOutLVis samples=${toeOutL.length}');
+
   return FrontalResult(
     rightVvt: vvtR.isEmpty ? 0 : Round.r2(mean(vvtR)),
     leftVvt: vvtL.isEmpty ? 0 : Round.r2(mean(vvtL)),
@@ -246,6 +298,8 @@ FrontalResult extractFrontal(
     stepWidthProxy: stepWidths.isEmpty ? 0 : Round.r3(mean(stepWidths)),
     fppaRight: fppaDev(fppaR),
     fppaLeft: fppaDev(fppaL),
+    toeOutRight: toeOutR.length >= 2 ? Round.r1(median(toeOutR)) : null,
+    toeOutLeft: toeOutL.length >= 2 ? Round.r1(median(toeOutL)) : null,
     hsRightFrontal: hsRightF,
     hsLeftFrontal: hsLeftF,
     phaseRightFrontal: phaseRf,

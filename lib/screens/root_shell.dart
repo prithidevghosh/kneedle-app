@@ -4,6 +4,7 @@ import 'doctor_report_screen.dart';
 import 'history_screen.dart';
 import 'home_screen.dart';
 import 'pain_journal_screen.dart';
+import 'reminders_screen.dart';
 
 /// Bottom-nav shell. Replaces the stacked button list — primary surfaces are
 /// one tap away, secondary actions (gait capture, exercise coach) live inside
@@ -21,6 +22,7 @@ class _RootShellState extends State<RootShell> {
   static const _tabs = <Widget>[
     HomeScreen(),
     PainJournalScreen(),
+    RemindersScreen(),
     HistoryScreen(),
     DoctorReportScreen(),
   ];
@@ -50,6 +52,11 @@ class _RootShellState extends State<RootShell> {
                 icon: Icon(Icons.mic_none_rounded),
                 selectedIcon: Icon(Icons.mic_rounded),
                 label: 'Journal',
+              ),
+              NavigationDestination(
+                icon: Icon(Icons.notifications_none_rounded),
+                selectedIcon: Icon(Icons.notifications_rounded),
+                label: 'Reminders',
               ),
               NavigationDestination(
                 icon: Icon(Icons.show_chart_rounded),

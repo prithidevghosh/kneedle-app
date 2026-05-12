@@ -1,7 +1,9 @@
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../models/appointment.dart';
 import '../models/exercise_session.dart';
 import '../models/gait_session.dart';
+import '../models/medication.dart';
 import '../models/pain_entry.dart';
 import '../services/gait_service.dart';
 import '../services/gemma_service.dart';
@@ -35,6 +37,14 @@ final exerciseSessionsProvider = Provider<List<ExerciseSession>>(
   (_) => StorageService.recentExerciseSessions(),
 );
 
+final medicationsProvider = Provider<List<Medication>>(
+  (_) => StorageService.allMedications(),
+);
+
+final appointmentsProvider = Provider<List<Appointment>>(
+  (_) => StorageService.upcomingAppointments(),
+);
+
 /// Bumped after each Hive write to trigger UI refresh.
 final dataRevisionProvider = StateProvider<int>((_) => 0);
 
@@ -43,5 +53,7 @@ void bumpData(WidgetRef ref) {
   ref
     ..invalidate(painEntriesProvider)
     ..invalidate(gaitSessionsProvider)
-    ..invalidate(exerciseSessionsProvider);
+    ..invalidate(exerciseSessionsProvider)
+    ..invalidate(medicationsProvider)
+    ..invalidate(appointmentsProvider);
 }

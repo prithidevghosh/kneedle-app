@@ -34,6 +34,35 @@ String assessSeverity(GaitMetrics m) {
   return 'mild';
 }
 
+/// Gatekeeper: returns `null` when the metrics carry enough signal for the
+/// LLM to produce a meaningful, safe analysis. Otherwise returns a short,
+/// patient-facing reason explaining what to fix on the next recording.
+///
+/// Without this check we'd ship payloads like the production log where
+/// `symmetry_score`, `knee_angle_diff`, and both toe-out angles all came back
+/// as `not detected` — Gemma would then hallucinate over null fields and we'd
+/// burn ~6 minutes of on-device decode for advice the patient can't trust.
+String? validateMetricsForAnalysis(GaitMetrics m) {
+  if (m.kneeAngleLeft == null && m.kneeAngleRight == null) {
+    return 'No knee angles were detected. Make sure your full body is in '
+        'frame from head to feet during both recordings.';
+  }
+  if (m.kneeAngleLeft == null || m.kneeAngleRight == null) {
+    return 'Only one knee was detected. Stand so both legs stay in frame '
+        'for the whole 8-second recording, then try again.';
+  }
+  if (m.symmetryScore == null) {
+    return 'Could not compute gait symmetry — the frontal and side views '
+        'did not line up. Re-record with both legs in frame and steady '
+        'walking pace.';
+  }
+  if (m.framesAnalysed < 8) {
+    return 'Too few usable frames were captured (${m.framesAnalysed}). '
+        'Try again with better lighting and the full body visible.';
+  }
+  return null;
+}
+
 /// Map raw symmetry score (0–100) to a patient-facing band.
 /// Returns "unknown" when score is missing — happens when the sagittal
 /// pipeline detected per-side sample imbalance and suppressed the score.

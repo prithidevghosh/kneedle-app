@@ -56,7 +56,7 @@ class HomeScreen extends ConsumerWidget {
                   const SizedBox(height: KneedleTheme.space4),
                   _PrimaryAction(
                     title: 'Run a gait check',
-                    subtitle: '5-second walk · on-device analysis',
+                    subtitle: '8-second walk · on-device analysis',
                     icon: Icons.directions_walk_rounded,
                     accent: KneedleTheme.sage,
                     accentSoft: KneedleTheme.sageTint,
