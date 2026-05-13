@@ -600,7 +600,10 @@ class _GaitCaptureScreenState extends ConsumerState<GaitCaptureScreen> {
 
       Navigator.of(context).pushReplacement(
         MaterialPageRoute(
-          builder: (_) => GaitResultScreen(response: analysis),
+          builder: (_) => GaitResultScreen(
+            response: analysis,
+            lang: widget.lang,
+          ),
         ),
       );
     } catch (e) {

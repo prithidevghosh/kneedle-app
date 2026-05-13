@@ -10,10 +10,16 @@ import '../models/pain_entry.dart';
 import '../providers/providers.dart';
 import '../widgets/widgets.dart';
 import 'doctor_report_screen.dart';
+import 'gait_chat_screen.dart';
 
 class GaitResultScreen extends ConsumerWidget {
-  const GaitResultScreen({super.key, required this.response});
+  const GaitResultScreen({
+    super.key,
+    required this.response,
+    this.lang = 'en',
+  });
   final AnalysisResponse response;
+  final String lang;
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
@@ -125,6 +131,19 @@ class GaitResultScreen extends ConsumerWidget {
                     ),
                   ),
                 ],
+              ),
+            ),
+
+            // ── ASK KNEEDLE CTA ────────────────────────────────────────
+            const SizedBox(height: KneedleTheme.space4),
+            _AskKneedleCard(
+              onTap: () => Navigator.of(context).push(
+                MaterialPageRoute(
+                  builder: (_) => GaitChatScreen(
+                    response: response,
+                    lang: lang,
+                  ),
+                ),
               ),
             ),
 
@@ -1150,6 +1169,78 @@ class _BodyDiagramPainter extends CustomPainter {
 // ───────────────────────────────────────────────────────────────────────
 // Share-with-doctor CTA (#9)
 // ───────────────────────────────────────────────────────────────────────
+
+class _AskKneedleCard extends StatelessWidget {
+  const _AskKneedleCard({required this.onTap});
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: Colors.transparent,
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(KneedleTheme.radiusLg),
+        child: Container(
+          padding: const EdgeInsets.all(KneedleTheme.space4),
+          decoration: BoxDecoration(
+            color: KneedleTheme.sageSoft,
+            borderRadius: BorderRadius.circular(KneedleTheme.radiusLg),
+            border: Border.all(color: KneedleTheme.sageTint),
+          ),
+          child: Row(
+            children: [
+              Container(
+                width: 44,
+                height: 44,
+                decoration: const BoxDecoration(
+                  color: KneedleTheme.sage,
+                  shape: BoxShape.circle,
+                ),
+                alignment: Alignment.center,
+                child: const Icon(
+                  Icons.mic_rounded,
+                  color: Colors.white,
+                  size: 22,
+                ),
+              ),
+              const SizedBox(width: KneedleTheme.space3),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      'Ask Kneedle about your report',
+                      style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                            color: KneedleTheme.sageDeep,
+                            fontWeight: FontWeight.w600,
+                          ),
+                    ),
+                    const SizedBox(height: 2),
+                    const Text(
+                      'Questions about your knee, walking pattern, or exercises — '
+                      'I\'ll answer using your real numbers.',
+                      style: TextStyle(
+                        fontSize: 13.5,
+                        height: 1.4,
+                        color: KneedleTheme.inkMuted,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const Icon(
+                Icons.arrow_forward_rounded,
+                color: KneedleTheme.sageDeep,
+                size: 22,
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
 
 class _ShareWithDoctorButton extends StatelessWidget {
   const _ShareWithDoctorButton({required this.onTap});

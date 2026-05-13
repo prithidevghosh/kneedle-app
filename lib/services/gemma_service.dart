@@ -316,10 +316,70 @@ class GemmaService {
     }
   }
 
+  /// Open a long-lived chat session pre-loaded with the patient's gait
+  /// analysis. Use this when the user is in a sustained Q&A on the result
+  /// screen — each [GaitChatSession.ask] call reuses the same KV cache, so
+  /// follow-up questions only prefill the new user message (~50 tokens)
+  /// instead of re-prefilling system + context + history every turn
+  /// (~2k tokens). The first call still pays full cold prefill, but we kick
+  /// off a background warmup here so most of it happens while the user is
+  /// still reading the screen.
+  ///
+  /// MUST be paired with [GaitChatSession.close] on screen dispose — the
+  /// session holds ~150–250 MB of KV cache.
+  Future<GaitChatSession> openGaitChat({
+    required AnalysisResponse response,
+    required String lang,
+  }) async {
+    _ensure();
+    final ctxBlock =
+        formatGaitContextBlock(response.toContextJson(), lang);
+    final sys = buildVoiceChatSystemPrompt(
+      lang: lang,
+      gaitContextBlock: ctxBlock,
+    );
+
+    final chat = await _model!.createChat(
+      temperature: 0.7,
+      topK: 40,
+      topP: 0.9,
+      supportsFunctionCalls: false,
+      tools: const [],
+    );
+
+    // Queue the system prompt + a 1-token warmup elicitation. The first call
+    // to generateChatResponse triggers native prefill of everything queued so
+    // far — we run it eagerly in the background here so the user's first
+    // real question pays only its own (~50-token) prefill.
+    await chat.addQueryChunk(Message.text(
+      text:
+          '$sys\n\nWhen you have read this report and are ready to answer '
+          "questions about it, reply with exactly one word: Ready.",
+      isUser: true,
+    ));
+
+    final warmSw = Stopwatch()..start();
+    final warmupFuture = chat.generateChatResponse().then((r) {
+      final txt = r is TextResponse ? r.token.trim() : '';
+      // ignore: avoid_print
+      print('[GemmaService] gait chat warmup done in '
+          '${warmSw.elapsedMilliseconds}ms (model said: "$txt")');
+    }).catchError((Object e) {
+      // ignore: avoid_print
+      print('[GemmaService] gait chat warmup failed (non-fatal): $e');
+    });
+
+    return GaitChatSession._(chat: chat, warmupFuture: warmupFuture);
+  }
+
   /// Voice-chat with the patient's last gait analysis baked into the system
   /// prompt. Direct port of `voice_chat_service.chat`. `history` is a list of
   /// `{role: 'user'|'assistant', content: '...'}` maps; rotate it via
   /// `trimHistory`.
+  ///
+  /// Prefer [openGaitChat] for multi-turn flows — it keeps one session alive
+  /// across questions instead of rebuilding the prefill every turn. This
+  /// transient-session variant remains for one-shot uses.
   Future<String> chatWithGaitContext({
     required String userText,
     required String lang,
@@ -459,6 +519,37 @@ class GemmaService {
           'visit / doctor / physio.',
       parameters: {'type': 'object', 'properties': {}},
     ),
+    Tool(
+      name: 'remove_medication',
+      description:
+          'Delete a daily medication reminder by name. Use when the user '
+          'asks to stop / cancel / remove a recurring medication, e.g. '
+          '"remove my thyroid reminder", "stop the metformin alarm". Matches '
+          'the name as a case-insensitive substring; if multiple medications '
+          'match, the tool returns the candidates so you can ask which one.',
+      parameters: {
+        'type': 'object',
+        'properties': {
+          'name': {'type': 'string'},
+        },
+        'required': ['name'],
+      },
+    ),
+    Tool(
+      name: 'remove_appointment',
+      description:
+          'Delete an upcoming appointment by title. Use when the user asks '
+          'to cancel / remove / drop a doctor / physio / scan visit. Matches '
+          'the title as a case-insensitive substring; if multiple match, the '
+          'tool returns the candidates so you can ask which one.',
+      parameters: {
+        'type': 'object',
+        'properties': {
+          'title': {'type': 'string'},
+        },
+        'required': ['title'],
+      },
+    ),
   ];
 
   /// Tools whose `acknowledgement` string is already user-ready. After these
@@ -471,6 +562,8 @@ class GemmaService {
     'schedule_reminder',
     'add_medication',
     'add_appointment',
+    'remove_medication',
+    'remove_appointment',
   };
 
   Future<String> _handleResponse(
@@ -648,6 +741,98 @@ class GemmaService {
           'count': appts.length,
           'now': DateTime.now().toIso8601String(),
           'appointments': [for (final a in appts) a.toJson()],
+        };
+
+      case 'remove_medication':
+        final query = (args['name'] as String?)?.trim().toLowerCase() ?? '';
+        if (query.isEmpty) {
+          return {
+            'ok': false,
+            'error': 'name_required',
+            'acknowledgement':
+                'Which medication should I remove? Tell me the name.',
+          };
+        }
+        final all = StorageService.allMedications();
+        final matches =
+            all.where((m) => m.name.toLowerCase().contains(query)).toList();
+        if (matches.isEmpty) {
+          return {
+            'ok': false,
+            'error': 'not_found',
+            'acknowledgement':
+                'I don\'t see a medication called "${args['name']}". '
+                'Say "list medications" to check what\'s saved.',
+          };
+        }
+        if (matches.length > 1) {
+          // Ambiguous — fall through to model (ok=false skips the terminal
+          // short-circuit) so it can ask which one. We return the candidates
+          // so the follow-up has full context.
+          return {
+            'ok': false,
+            'error': 'ambiguous',
+            'candidates': [for (final m in matches) m.toJson()],
+            'acknowledgement':
+                'You have ${matches.length} medications matching '
+                '"${args['name']}": '
+                '${matches.map((m) => '${m.name} at ${m.timeLabel}').join(', ')}. '
+                'Which one should I remove?',
+          };
+        }
+        final target = matches.single;
+        await NotificationService.cancel(target.id);
+        await StorageService.deleteMedication(target.id);
+        return {
+          'ok': true,
+          'acknowledgement':
+              'Removed your daily reminder for ${target.name} '
+              '(${target.timeLabel}).',
+        };
+
+      case 'remove_appointment':
+        final query = (args['title'] as String?)?.trim().toLowerCase() ?? '';
+        if (query.isEmpty) {
+          return {
+            'ok': false,
+            'error': 'title_required',
+            'acknowledgement':
+                'Which appointment should I remove? Tell me the title.',
+          };
+        }
+        final all = StorageService.upcomingAppointments();
+        final matches =
+            all.where((a) => a.title.toLowerCase().contains(query)).toList();
+        if (matches.isEmpty) {
+          return {
+            'ok': false,
+            'error': 'not_found',
+            'acknowledgement':
+                'I don\'t see an upcoming appointment matching '
+                '"${args['title']}".',
+          };
+        }
+        if (matches.length > 1) {
+          return {
+            'ok': false,
+            'error': 'ambiguous',
+            'candidates': [for (final a in matches) a.toJson()],
+            'acknowledgement':
+                'You have ${matches.length} appointments matching '
+                '"${args['title']}": '
+                '${matches.map((a) => '${a.title} on ${_formatDate(a.when)} at ${_formatWhen(a.when)}').join(', ')}. '
+                'Which one should I remove?',
+          };
+        }
+        final apptTarget = matches.single;
+        await NotificationService.cancel(apptTarget.id);
+        await StorageService.deleteAppointment(apptTarget.id);
+        return {
+          'ok': true,
+          'acknowledgement':
+              'Removed: ${apptTarget.title} on '
+              '${_formatDate(apptTarget.when)} at '
+              '${_formatWhen(apptTarget.when)}.',
         };
 
       default:
@@ -1028,5 +1213,47 @@ class GemmaService {
     await _model?.close();
     _chat = null;
     _model = null;
+  }
+}
+
+/// Persistent chat session preloaded with one patient's gait analysis. Backs
+/// [GemmaService.openGaitChat] — owns an [InferenceChat] that lives for the
+/// duration of the gait-result Q&A screen. Call [close] on screen dispose to
+/// release the underlying KV cache (~150–250 MB on Gemma 4 E2B INT4).
+class GaitChatSession {
+  GaitChatSession._({
+    required InferenceChat chat,
+    required Future<void> warmupFuture,
+  })  : _chat = chat,
+        _warmupFuture = warmupFuture;
+
+  final InferenceChat _chat;
+  final Future<void> _warmupFuture;
+  bool _disposed = false;
+
+  /// Ask one question. Waits for the background warmup to finish on the very
+  /// first call, then prefills only the new user message + previous reply —
+  /// the system prompt + gait context are already in the KV cache.
+  Future<String> ask(String userText) async {
+    if (_disposed) {
+      throw StateError('GaitChatSession is closed');
+    }
+    if (userText.trim().isEmpty) return '';
+    // Block on the warmup prefill before the first user turn; on every later
+    // turn this future is already complete so it's a no-op.
+    await _warmupFuture;
+    await _chat.addQueryChunk(Message.text(text: userText, isUser: true));
+    final response = await _chat.generateChatResponse();
+    if (response is TextResponse) return GemmaService._stripThink(response.token);
+    return '';
+  }
+
+  Future<void> close() async {
+    if (_disposed) return;
+    _disposed = true;
+    try {
+      // ignore: avoid_dynamic_calls
+      await (_chat as dynamic).close();
+    } catch (_) {/* InferenceChat variants disagree on close API */}
   }
 }
