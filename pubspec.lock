@@ -246,14 +246,6 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "2.0.34"
-  flutter_pose_detection:
-    dependency: "direct main"
-    description:
-      name: flutter_pose_detection
-      sha256: "0ea64e9823f5fd9c2541ebcbe973e981e4551390b7be6dbc89b9f18611fade01"
-      url: "https://pub.dev"
-    source: hosted
-    version: "0.4.1"
   flutter_riverpod:
     dependency: "direct main"
     description:
@@ -296,6 +288,22 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "2.1.3"
+  google_mlkit_commons:
+    dependency: "direct main"
+    description:
+      name: google_mlkit_commons
+      sha256: "3e69fea4211727732cc385104e675ad1e40b29f12edd492ee52fa108423a6124"
+      url: "https://pub.dev"
+    source: hosted
+    version: "0.11.1"
+  google_mlkit_pose_detection:
+    dependency: "direct main"
+    description:
+      name: google_mlkit_pose_detection
+      sha256: "9157847e41fff1703b6b16b1af5508cf5def85cad96b7b724394fa9fe386cb8f"
+      url: "https://pub.dev"
+    source: hosted
+    version: "0.14.1"
   hive:
     dependency: "direct main"
     description:

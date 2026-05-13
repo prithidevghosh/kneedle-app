@@ -1,10 +1,13 @@
 import 'dart:async';
+import 'dart:io' show Platform;
 import 'dart:typed_data';
 
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter_pose_detection/flutter_pose_detection.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:google_mlkit_commons/google_mlkit_commons.dart';
+import 'package:google_mlkit_pose_detection/google_mlkit_pose_detection.dart'
+    as mlkit;
 import 'package:speech_to_text/speech_to_text.dart';
 
 import '../clinical/severity.dart';
@@ -39,7 +42,14 @@ class _GaitCaptureScreenState extends ConsumerState<GaitCaptureScreen> {
   static const _captureSeconds = 8;
 
   CameraController? _camera;
-  final NpuPoseDetector _pose = NpuPoseDetector();
+  // Stream-mode pose detection: lower latency, no full-frame buffering.
+  // Same 33-landmark BlazePose topology as the Android side previously used.
+  final mlkit.PoseDetector _pose = mlkit.PoseDetector(
+    options: mlkit.PoseDetectorOptions(
+      mode: mlkit.PoseDetectionMode.stream,
+      model: mlkit.PoseDetectionModel.accurate,
+    ),
+  );
   final SpeechToText _stt = SpeechToText();
   bool _sttReady = false;
   bool _wakeActive = false;
@@ -82,18 +92,16 @@ class _GaitCaptureScreenState extends ConsumerState<GaitCaptureScreen> {
     _wakeActive = false;
     _stt.stop();
     _camera?.dispose();
-    _pose.dispose();
+    _pose.close();
     super.dispose();
   }
 
   Future<void> _bootstrap() async {
     try {
-      // Kick off pose init NOW — overlaps with camera init's I/O / native
-      // setup. Doing this AFTER the preview starts rendering causes a multi-
-      // second main-thread stall (GPU contention with the live preview) and
-      // an ANR. Doing it now means both heavy loads happen during the
-      // "loading…" placeholder phase, where there is no UI to block.
-      _poseReady = _pose.initialize();
+      // ML Kit's PoseDetector lazy-initialises on the first processImage call;
+      // no explicit init step. Leave _poseReady as already-completed so the
+      // capture path's `await _poseReady` is a no-op.
+      _poseReady = Future.value();
 
       final cams = await availableCameras();
       final front = cams.firstWhere(
@@ -303,53 +311,21 @@ class _GaitCaptureScreenState extends ConsumerState<GaitCaptureScreen> {
     final idx = _frameSeq++;
     final tMs = DateTime.now().difference(startedAt).inMilliseconds;
     try {
-      // The pose plugin's native YUV→Bitmap converter assumes tightly-packed
-      // planes: Y of length width*height, U/V each of length width*height/4,
-      // pixelStride=1. On most modern Android devices the camera plugin
-      // delivers stride-padded Y (e.g. 720×768 for a 720×480 frame) and
-      // chroma with pixelStride=2 (NV21 layout exposed as two planes). The
-      // plugin's converter then offsets into a 518400-byte NV21 buffer using
-      // the padded yPlane.size and walks straight off the end. Repacking in
-      // Dart sidesteps the bug: we copy each row honouring rowStride, drop
-      // the trailing padding, and de-interleave U/V honouring pixelStride.
-      // Cost is one full O(width*height) pass per frame ≈ 1-3 ms — well
-      // inside the 100 ms budget per frame.
-      final isYuv = image.format.group == ImageFormatGroup.yuv420;
-      final planes = isYuv
-          ? _repackYuv420(image)
-          : [
-              for (final p in image.planes)
-                {
-                  'bytes': p.bytes,
-                  'bytesPerRow': p.bytesPerRow,
-                  'bytesPerPixel': p.bytesPerPixel ?? 1,
-                },
-            ];
-      final format = isYuv ? 'yuv420' : 'bgra8888';
-      final rotation = _camera?.description.sensorOrientation ?? 0;
-      _firstFrameSummary ??= 'format=$format, '
+      // ML Kit consumes a single InputImage built from CameraImage planes.
+      // Android camera plugin delivers YUV_420_888 → flattened NV21 bytes;
+      // iOS delivers BGRA8888 (single plane). We pass them through directly —
+      // ML Kit handles row-stride internally on Android, so no Dart-side
+      // repack is needed (the old flutter_pose_detection converter bug is
+      // gone with the plugin).
+      final inputImage = _buildInputImage(image);
+      if (inputImage == null) return;
+      _firstFrameSummary ??= 'format=${image.format.group}, '
           '${image.width}x${image.height}, '
-          'planes=${planes.length}, rotation=$rotation, '
-          'firstPlaneBytes=${planes.first['bytes'] is Iterable ? (planes.first['bytes'] as dynamic).length : '?'}';
-      final result = await _pose.processFrame(
-        planes: planes,
-        width: image.width,
-        height: image.height,
-        format: format,
-        rotation: rotation,
-      );
-      final pose = result.firstPose;
-      final landmarks = pose == null
-          ? null
-          : [
-              for (final lm in pose.landmarks)
-                gait.Landmark(
-                  x: lm.x,
-                  y: lm.y,
-                  z: lm.z,
-                  visibility: lm.visibility,
-                ),
-            ];
+          'planes=${image.planes.length}, '
+          'firstPlaneBytes=${image.planes.first.bytes.length}';
+      final poses = await _pose.processImage(inputImage);
+      final pose = poses.isEmpty ? null : poses.first;
+      final landmarks = pose == null ? null : _buildLandmarkList(pose, image);
       double confidence = 0;
       if (landmarks != null) {
         double meanVis(int a, int b, int c) =>
@@ -389,75 +365,122 @@ class _GaitCaptureScreenState extends ConsumerState<GaitCaptureScreen> {
     }
   }
 
-  /// Convert a CameraImage's YUV_420_888 planes (with arbitrary row stride
-  /// and chroma pixel stride) into the tightly-packed three-plane layout the
-  /// `flutter_pose_detection` Android converter expects:
+  /// Build a Google ML Kit `InputImage` from the camera plugin's `CameraImage`.
   ///
-  ///   * Y plane: `width * height` bytes, no padding, pixelStride=1.
-  ///   * U plane: `(width/2) * (height/2)` bytes, no padding, pixelStride=1.
-  ///   * V plane: same shape as U.
-  ///
-  /// The native side then concatenates these in NV21 order via its (broken)
-  /// arithmetic, but with our packed inputs that arithmetic now lands inside
-  /// the buffer and produces a correct image. See callsite for the full
-  /// rationale.
-  List<Map<String, dynamic>> _repackYuv420(CameraImage image) {
+  /// Android delivers YUV_420_888 across 3 planes; ML Kit's Android side
+  /// expects a single flattened NV21 byte buffer. iOS delivers BGRA8888 in
+  /// one plane and ML Kit's iOS side wants raw plane bytes + bytesPerRow.
+  /// We branch on `Platform` because the plugin's documented contract differs
+  /// per-OS.
+  InputImage? _buildInputImage(CameraImage image) {
+    final cam = _camera?.description;
+    if (cam == null) return null;
+
+    final rotation = InputImageRotationValue.fromRawValue(cam.sensorOrientation)
+        ?? InputImageRotation.rotation0deg;
+
+    if (Platform.isAndroid) {
+      // Flatten YUV_420_888 planes into NV21 (Y followed by interleaved VU).
+      final nv21 = _yuv420ToNv21(image);
+      return InputImage.fromBytes(
+        bytes: nv21,
+        metadata: InputImageMetadata(
+          size: Size(image.width.toDouble(), image.height.toDouble()),
+          rotation: rotation,
+          format: InputImageFormat.nv21,
+          bytesPerRow: image.width,
+        ),
+      );
+    }
+
+    // iOS: BGRA8888, single plane.
+    final plane = image.planes.first;
+    return InputImage.fromBytes(
+      bytes: plane.bytes,
+      metadata: InputImageMetadata(
+        size: Size(image.width.toDouble(), image.height.toDouble()),
+        rotation: rotation,
+        format: InputImageFormat.bgra8888,
+        bytesPerRow: plane.bytesPerRow,
+      ),
+    );
+  }
+
+  /// Flatten a CameraImage's YUV_420_888 planes into a single NV21 buffer
+  /// (Y followed by interleaved VU). Honours rowStride/pixelStride so the
+  /// output is dense regardless of how the camera HAL padded the input.
+  Uint8List _yuv420ToNv21(CameraImage image) {
     final width = image.width;
     final height = image.height;
     final yPlane = image.planes[0];
     final uPlane = image.planes[1];
     final vPlane = image.planes[2];
 
-    // Y: copy each row, taking exactly `width` bytes and skipping any row
-    // padding. Bulk-copy fast path when there's no padding to skip.
-    final yOut = Uint8List(width * height);
+    final yBytes = yPlane.bytes;
+    final uBytes = uPlane.bytes;
+    final vBytes = vPlane.bytes;
+    final ySize = width * height;
+    final uvSize = ySize ~/ 2;
+    final out = Uint8List(ySize + uvSize);
+
+    // Y plane: copy row-by-row, stripping any rowStride padding.
     if (yPlane.bytesPerRow == width) {
-      yOut.setRange(0, width * height, yPlane.bytes);
+      out.setRange(0, ySize, yBytes);
     } else {
       for (var row = 0; row < height; row++) {
         final src = row * yPlane.bytesPerRow;
-        yOut.setRange(row * width, (row + 1) * width, yPlane.bytes, src);
+        out.setRange(row * width, (row + 1) * width, yBytes, src);
       }
     }
 
-    // U / V: half resolution. pixelStride may be 1 (planar) or 2 (chroma
-    // semi-planar exposed as two planes — common on Android). The two-plane
-    // pixelStride=2 case is the NV21/NV12 layout where U and V interleave
-    // in the same underlying buffer.
-    final uvWidth = width ~/ 2;
-    final uvHeight = height ~/ 2;
-    final uOut = Uint8List(uvWidth * uvHeight);
-    final vOut = Uint8List(uvWidth * uvHeight);
+    // Chroma: interleave as VU (NV21). pixelStride=2 means U/V already
+    // live in the same buffer one byte apart, so we can sometimes bulk-copy;
+    // pixelStride=1 (planar) means we need to interleave manually.
     final uPx = uPlane.bytesPerPixel ?? 1;
     final vPx = vPlane.bytesPerPixel ?? 1;
-
-    final uBytes = uPlane.bytes;
-    final vBytes = vPlane.bytes;
+    final uvWidth = width ~/ 2;
+    final uvHeight = height ~/ 2;
     final uStride = uPlane.bytesPerRow;
     final vStride = vPlane.bytesPerRow;
     final uLen = uBytes.length;
     final vLen = vBytes.length;
 
+    var dst = ySize;
     for (var row = 0; row < uvHeight; row++) {
       final uRow = row * uStride;
       final vRow = row * vStride;
-      final outRow = row * uvWidth;
       for (var col = 0; col < uvWidth; col++) {
         final uIdx = uRow + col * uPx;
         final vIdx = vRow + col * vPx;
-        // Bounds-guard the last pixel of NV21-style interleaved chroma —
-        // V plane is typically one byte shorter than the index would
-        // suggest because it ends at the second-to-last interleaved byte.
-        uOut[outRow + col] = uIdx < uLen ? uBytes[uIdx] : 0;
-        vOut[outRow + col] = vIdx < vLen ? vBytes[vIdx] : 0;
+        out[dst++] = vIdx < vLen ? vBytes[vIdx] : 0;
+        out[dst++] = uIdx < uLen ? uBytes[uIdx] : 0;
       }
     }
 
-    return [
-      {'bytes': yOut, 'bytesPerRow': width, 'bytesPerPixel': 1},
-      {'bytes': uOut, 'bytesPerRow': uvWidth, 'bytesPerPixel': 1},
-      {'bytes': vOut, 'bytesPerRow': uvWidth, 'bytesPerPixel': 1},
-    ];
+    return out;
+  }
+
+  /// Adapt ML Kit's typed-enum landmark map to the 33-index `List<Landmark>`
+  /// the gait pipeline expects (indices defined in [gait.Lm], matching
+  /// MediaPipe BlazePose). ML Kit returns landmarks in image-pixel space —
+  /// we normalise to [0, 1] against the frame size so the pipeline math
+  /// (which is resolution-agnostic) keeps working unchanged.
+  List<gait.Landmark> _buildLandmarkList(mlkit.Pose pose, CameraImage image) {
+    final w = image.width.toDouble();
+    final h = image.height.toDouble();
+    final out = List<gait.Landmark>.filled(33, gait.Landmark.zero);
+    for (final entry in pose.landmarks.entries) {
+      final idx = entry.key.index;
+      if (idx < 0 || idx >= 33) continue;
+      final lm = entry.value;
+      out[idx] = gait.Landmark(
+        x: w == 0 ? 0 : lm.x / w,
+        y: h == 0 ? 0 : lm.y / h,
+        z: lm.z,
+        visibility: lm.likelihood,
+      );
+    }
+    return out;
   }
 
   void _resetStreamCounters() {

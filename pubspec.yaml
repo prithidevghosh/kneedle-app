@@ -18,7 +18,11 @@ dependencies:
   flutter_gemma: ^0.15.0
 
   # Pose & camera
-  flutter_pose_detection: ^0.4.1
+  # google_mlkit_pose_detection works on iOS+Android with the same 33-landmark
+  # BlazePose topology; replaces flutter_pose_detection (incompatible TFLite
+  # pin against flutter_gemma's LiteRT on iOS).
+  google_mlkit_pose_detection: ^0.14.0
+  google_mlkit_commons: ^0.11.0
   camera: ^0.11.0+2
 
   # Voice
