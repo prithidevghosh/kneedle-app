@@ -49,6 +49,12 @@ dependencies:
   intl: ^0.19.0
   collection: ^1.18.0
 
+  # JPEG encoding for the 4 video frames we attach to Gemma's multimodal
+  # analysis prompt (2 frontal + 2 sagittal). The camera plugin delivers raw
+  # YUV/BGRA bytes; we convert → RGB → JPEG so flutter_gemma's vision encoder
+  # can ingest them.
+  image: ^4.3.0
+
 dev_dependencies:
   flutter_test:
     sdk: flutter

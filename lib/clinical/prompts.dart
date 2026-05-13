@@ -37,7 +37,10 @@ $langRule
 You will be given:
 1. Precise biomechanical measurements extracted by MediaPipe Pose from the
    patient's walking video (joint angles, symmetry, trunk lean, cadence).
-   These numbers are your sole source of truth — no raw video is attached.
+   These numbers are your source of truth for quantitative claims. Up to 4
+   still frames from the same recording (frontal + sagittal views) may be
+   attached for visual context — use them to ground your prose, not to
+   invent measurements.
 2. A pre-computed severity tier (normal/mild/moderate/severe) — TRUST IT.
    "normal" means no clinical OA signs detected — frame the response as
    reassurance + general conditioning, not treatment.
@@ -88,6 +91,8 @@ String buildAnalysisUserPrompt({
   required String knee,
   required String severity,
   required List<ExerciseDef> library,
+  int frontalFrameCount = 0,
+  int sagittalFrameCount = 0,
 }) {
   const kneeDesc = {
     'left': 'left knee',
@@ -152,10 +157,15 @@ PRIMARY CLINICAL FINDING: $primaryFinding
 SEVERITY TIER (computed deterministically): ${severity.toUpperCase()}
 SEVERITY GUIDANCE: ${severityGuidance[severity] ?? severityGuidance['moderate']}
 
-Reason directly from the MediaPipe measurements above. No video frames are
+${(frontalFrameCount + sagittalFrameCount) == 0 ? '''Reason directly from the MediaPipe measurements above. No video frames are
 provided — the on-device pose pipeline has already extracted the clinically
 relevant signals (knee flexion angles, symmetry, trunk lean, toe-out,
-cadence). Treat those numbers as your sole source of truth.
+cadence). Treat those numbers as your sole source of truth.''' : '''Reason primarily from the MediaPipe measurements above — those numbers are
+your source of truth for any quantitative claim. $frontalFrameCount frontal
+(walking toward camera) and $sagittalFrameCount sagittal (walking sideways)
+snapshots from the same recording are attached as images for visual context
+only; use them to ground your prose ("I can see your trunk leaning right"),
+not to invent new measurements.'''}
 
 SEVERITY-FILTERED EXERCISE LIBRARY:
 You MUST select exactly 3 exercises from THIS LIST ONLY. Do not invent

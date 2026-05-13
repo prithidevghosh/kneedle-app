@@ -8,6 +8,7 @@ import '../models/analysis_response.dart';
 import '../models/gait_session.dart';
 import '../models/pain_entry.dart';
 import '../providers/providers.dart';
+import '../services/gemma_service.dart';
 import '../widgets/widgets.dart';
 import 'doctor_report_screen.dart';
 import 'gait_chat_screen.dart';
@@ -63,6 +64,10 @@ class GaitResultScreen extends ConsumerWidget {
           ),
           physics: const BouncingScrollPhysics(),
           children: [
+            if (response.stats != null) ...[
+              _GenStatsBar(stats: response.stats!),
+              const SizedBox(height: KneedleTheme.space3),
+            ],
             // ── HERO: severity + KL/Symmetry pills + body silhouette ──────
             Container(
               padding: const EdgeInsets.all(KneedleTheme.space5),
@@ -1324,6 +1329,52 @@ class _Pill extends StatelessWidget {
           color: accent,
           letterSpacing: -0.1,
         ),
+      ),
+    );
+  }
+}
+
+/// Slim summary bar shown at the very top of the result screen with the
+/// generation stats from the `analyseGait` call that produced this report.
+/// Lets the user (and a dev poking around) see decode speed at a glance.
+class _GenStatsBar extends StatelessWidget {
+  const _GenStatsBar({required this.stats});
+  final LlmStats stats;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding:
+          const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+      decoration: BoxDecoration(
+        color: KneedleTheme.sageTint,
+        borderRadius: BorderRadius.circular(KneedleTheme.radiusLg),
+        border: Border.all(
+          color: KneedleTheme.sage.withValues(alpha: 0.35),
+        ),
+      ),
+      child: Row(
+        children: [
+          const Icon(Icons.memory_rounded,
+              size: 16, color: KneedleTheme.sageDeep),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              'Generated on-device by Gemma 4 · '
+              '${stats.tokensPerSecond.toStringAsFixed(1)} tok/s · '
+              '${stats.outputTokens} tokens in ${stats.totalMs}ms '
+              '(prefill ${stats.prefillMs}ms, ttft ${stats.firstTokenMs}ms'
+              '${stats.imageCount > 0 ? ', ${stats.imageCount} frames' : ''})',
+              style: const TextStyle(
+                fontSize: 11,
+                fontWeight: FontWeight.w600,
+                color: KneedleTheme.sageDeep,
+                letterSpacing: 0.2,
+                height: 1.4,
+              ),
+            ),
+          ),
+        ],
       ),
     );
   }

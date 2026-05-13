@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:typed_data';
 import 'package:flutter/services.dart' show rootBundle;
 import 'package:flutter_gemma/flutter_gemma.dart';
 
@@ -12,8 +13,11 @@ import '../models/analysis_response.dart';
 import '../models/appointment.dart';
 import '../models/medication.dart';
 import '../models/pain_entry.dart';
+import 'gemma_stats.dart';
 import 'notification_service.dart';
 import 'storage_service.dart';
+
+export 'gemma_stats.dart';
 
 /// Singleton wrapper around `flutter_gemma`. Holds the loaded Gemma E2B model
 /// (LiteRT, INT4) and acts as a stand-in for what the FastAPI backend used to
@@ -52,15 +56,21 @@ class GemmaService {
   static const _modelUrl =
       'https://huggingface.co/litert-community/gemma-4-E2B-it-litert-lm/resolve/7fa1d78473894f7e736a21d920c3aa80f950c0db/gemma-4-E2B-it.litertlm';
 
-  // Vision path is disabled — gait analysis is text-only (metrics + library),
-  // and the companion chat doesn't accept images. Keeping this off reduces
-  // model memory and avoids loading the vision encoder.
-  static const _supportImage = false;
+  // Vision is enabled for gait analysis: we attach 4 JPEGs (2 frontal + 2
+  // sagittal walk frames) alongside the MediaPipe measurements so Gemma can
+  // visually cross-check what the numbers describe. The companion chat path
+  // still sends text only; only `analyseGait` builds a multimodal message.
+  static const _supportImage = true;
 
   InferenceModel? _model;
   InferenceChat? _chat;
   String? _systemPrompt;
   bool _initialising = false;
+
+  /// Stats from the most recent companion-chat or voice-chat call. Surfaced
+  /// in the home / voice screens via the tokens-per-second pill so the user
+  /// can see how fast Gemma is decoding.
+  LlmStats? lastStats;
 
   bool get isReady => _model != null && _chat != null;
 
@@ -176,6 +186,10 @@ class GemmaService {
       // generation headroom. Bump back up once we test on ≥8 GB hardware.
       maxTokens: 4096,
       supportImage: _supportImage,
+      // 4 = the gait-analysis bundle (2 frontal + 2 sagittal). Companion chat
+      // never sends images, so this is a strict upper bound for the only
+      // multimodal path we have.
+      maxNumImages: _supportImage ? 4 : null,
       enableSpeculativeDecoding: _useSpeculativeDecoding ? true : null,
     );
   }
@@ -184,9 +198,26 @@ class GemmaService {
 
   Future<String> chat(String userText) async {
     _ensure();
+    // ignore: avoid_print
+    print('[GemmaService] chat INPUT (${userText.length} chars): $userText');
+    final sw = Stopwatch()..start();
     await _chat!.addQueryChunk(Message.text(text: userText, isUser: true));
     final response = await _chat!.generateChatResponse();
-    return _handleResponse(response, originalUserText: userText);
+    final reply = await _handleResponse(response, originalUserText: userText);
+    sw.stop();
+    final stats = LlmStats(
+      inputChars: userText.length,
+      outputChars: reply.length,
+      outputTokens: (reply.length / 4).round(), // BPE ≈ 4 chars/token
+      generationMs: sw.elapsedMilliseconds,
+    );
+    lastStats = stats;
+    // ignore: avoid_print
+    print('[GemmaService] chat OUTPUT (${reply.length} chars): $reply');
+    // ignore: avoid_print
+    print('[GemmaService] chat STATS ${stats.summary()} '
+        '(token count approx — function-call path is not streamed)');
+    return reply;
   }
 
   Future<String> extractPainEntry(String voiceTranscript) async {
@@ -235,20 +266,45 @@ class GemmaService {
   ///  6. On any failure we drop into a severity-aware hardcoded response so
   ///     the patient is never left without guidance.
   ///
-  /// Text-only: the model receives metrics + the severity-filtered exercise
-  /// library, never raw video frames. Vision tokens add ~600 prefill tokens
-  /// per frame on E2B and didn't measurably improve picks in our tests.
+  /// Multimodal: the model receives metrics + the severity-filtered exercise
+  /// library AND up to 4 JPEG snapshots from the walking video (2 frontal,
+  /// 2 sagittal). Vision tokens add ~600 prefill tokens per frame on E2B, so
+  /// the caller is expected to keep the bundle ≤4 frames.
   Future<AnalysisResponse> analyseGait({
     required GaitMetrics metrics,
     required String age,
     required String knee,
     required String lang,
     required int sessionNumber,
+    List<Uint8List> frontalFrames = const [],
+    List<Uint8List> sagittalFrames = const [],
+    void Function(GemmaAnalysisEvent event)? onEvent,
   }) async {
+    final totalSw = Stopwatch()..start();
+    void emit(String stage,
+        {String message = '', String partial = '', LlmStats? stats}) {
+      onEvent?.call(GemmaAnalysisEvent(
+        stage: stage,
+        message: message,
+        partial: partial,
+        stats: stats,
+      ));
+    }
+
+    emit('prepare', message: 'Reading pose metrics…');
     final severity = assessSeverity(metrics);
     final symBand = computeSymmetryBand(metrics.symmetryScore);
     final library = filterLibraryBySeverity(severity);
     final safety = safetyFor(lang);
+
+    // Cap at 4 frames total (2 frontal + 2 sagittal) regardless of what the
+    // caller hands us — extra frames just burn prefill tokens.
+    final fFrames =
+        frontalFrames.length > 2 ? frontalFrames.sublist(0, 2) : frontalFrames;
+    final sFrames = sagittalFrames.length > 2
+        ? sagittalFrames.sublist(0, 2)
+        : sagittalFrames;
+    final attachedImages = <Uint8List>[...fFrames, ...sFrames];
 
     final systemPrompt = buildAnalysisSystemPrompt(lang);
     final userPrompt = buildAnalysisUserPrompt(
@@ -257,6 +313,8 @@ class GemmaService {
       knee: knee,
       severity: severity,
       library: library,
+      frontalFrameCount: fFrames.length,
+      sagittalFrameCount: sFrames.length,
     );
 
     try {
@@ -264,6 +322,8 @@ class GemmaService {
 
       // Use a fresh chat session so the analysis prompt isn't polluted by the
       // companion conversation history. The model is shared; sessions are not.
+      emit('prefill', message: 'Loading clinical context into Gemma…');
+      final sessionSw = Stopwatch()..start();
       final session = await _model!.createChat(
         temperature: 0.4,
         topK: 40,
@@ -271,21 +331,125 @@ class GemmaService {
         // Function calling explicitly OFF — clinical mode wants strict JSON.
         supportsFunctionCalls: false,
         tools: const [],
+        supportImage: attachedImages.isNotEmpty,
       );
+      // ignore: avoid_print
+      print('[GemmaService] analyseGait createChat: '
+          '${sessionSw.elapsedMilliseconds}ms');
       try {
+        // Detailed input log — full prompts go in so a developer reproducing a
+        // bad output can see exactly what the model saw. Prompts are clamped
+        // when the analysis is run live (no PII beyond age + knee) so logging
+        // them is fine for an on-device app.
+        // ignore: avoid_print
+        print('[GemmaService] analyseGait INPUT severity=$severity '
+            'symBand=$symBand age=$age knee=$knee lang=$lang '
+            'sessionNumber=$sessionNumber');
+        // ignore: avoid_print
+        print('[GemmaService] analyseGait INPUT system_prompt '
+            '(${systemPrompt.length} chars):\n$systemPrompt');
+        // ignore: avoid_print
+        print('[GemmaService] analyseGait INPUT user_prompt '
+            '(${userPrompt.length} chars):\n$userPrompt');
+        if (attachedImages.isNotEmpty) {
+          final sizes =
+              attachedImages.map((b) => '${b.length}B').join(', ');
+          // ignore: avoid_print
+          print('[GemmaService] analyseGait INPUT frames=${attachedImages.length} '
+              '(${fFrames.length} frontal + ${sFrames.length} sagittal) '
+              'sizes=[$sizes]');
+        }
+
+        final prefillSw = Stopwatch()..start();
         await session.addQueryChunk(
           Message.text(text: systemPrompt, isUser: true),
         );
+        // flutter_gemma 0.15 carries one image per Message. To pass 4, we
+        // chunk them one at a time with a short label, then the text prompt
+        // closes the user turn. Labels live in their own image-only chunk so
+        // the model can associate each image with frontal/sagittal context
+        // before it reads the metrics block.
+        for (var i = 0; i < fFrames.length; i++) {
+          await session.addQueryChunk(Message.withImage(
+            text: 'Frontal walk frame ${i + 1} of ${fFrames.length}.',
+            imageBytes: fFrames[i],
+            isUser: true,
+          ));
+        }
+        for (var i = 0; i < sFrames.length; i++) {
+          await session.addQueryChunk(Message.withImage(
+            text: 'Sagittal walk frame ${i + 1} of ${sFrames.length}.',
+            imageBytes: sFrames[i],
+            isUser: true,
+          ));
+        }
         await session.addQueryChunk(
           Message.text(text: userPrompt, isUser: true),
         );
+        prefillSw.stop();
         // ignore: avoid_print
-        print('[GemmaService] analyseGait prefill payload (text-only): '
-            'system=${systemPrompt.length} chars, '
-            'user=${userPrompt.length} chars');
-        final raw = await session.generateChatResponse();
-        final text = raw is TextResponse ? raw.token : raw.toString();
-        return _parseAnalysisJson(
+        print('[GemmaService] analyseGait queue done in '
+            '${prefillSw.elapsedMilliseconds}ms — starting stream');
+
+        emit(
+          'streaming',
+          message: attachedImages.isEmpty
+              ? 'Gemma is reading your metrics…'
+              : 'Gemma is looking at your walk frames…',
+        );
+
+        final stats = LlmStats(
+          inputChars: systemPrompt.length + userPrompt.length,
+          imageCount: attachedImages.length,
+        );
+        final genSw = Stopwatch()..start();
+        final firstTokenSw = Stopwatch()..start();
+        final buf = StringBuffer();
+        await for (final r in session.generateChatResponseAsync()) {
+          if (r is TextResponse) {
+            if (firstTokenSw.isRunning) {
+              firstTokenSw.stop();
+              stats.firstTokenMs = firstTokenSw.elapsedMilliseconds;
+              stats.prefillMs =
+                  prefillSw.elapsedMilliseconds + stats.firstTokenMs;
+              // Re-base generation timer so prefill ms doesn't pollute TPS.
+              genSw
+                ..reset()
+                ..start();
+            }
+            buf.write(r.token);
+            stats.outputTokens++;
+            stats.outputChars = buf.length;
+            stats.generationMs = genSw.elapsedMilliseconds;
+            // Throttle UI updates to ~every 4 tokens so we don't drown the
+            // event bus on a 30 tok/s stream.
+            if (stats.outputTokens % 4 == 0) {
+              emit('streaming',
+                  partial: buf.toString(),
+                  stats: stats,
+                  message: 'Gemma is drafting your plan…');
+            }
+          }
+        }
+        genSw.stop();
+        if (firstTokenSw.isRunning) {
+          firstTokenSw.stop();
+          stats.firstTokenMs = firstTokenSw.elapsedMilliseconds;
+          stats.prefillMs =
+              prefillSw.elapsedMilliseconds + stats.firstTokenMs;
+        }
+        final text = buf.toString();
+        // ignore: avoid_print
+        print('[GemmaService] analyseGait OUTPUT (${text.length} chars):\n'
+            '$text');
+        // ignore: avoid_print
+        print('[GemmaService] analyseGait STATS ${stats.summary()} '
+            '· total ${totalSw.elapsedMilliseconds}ms');
+        emit('parse',
+            message: 'Building your personalised plan…',
+            partial: text,
+            stats: stats);
+        final parsed = _parseAnalysisJson(
           raw: text,
           metrics: metrics,
           library: library,
@@ -295,6 +459,10 @@ class GemmaService {
           sessionNumber: sessionNumber,
           safety: safety,
         );
+        final enriched = parsed.copyWith(stats: stats);
+        emit('done',
+            message: 'Done', partial: text, stats: stats);
+        return enriched;
       } finally {
         // Best-effort cleanup; the plugin variants disagree on the close API.
         try {
@@ -405,6 +573,11 @@ class GemmaService {
       tools: const [],
     );
     try {
+      // ignore: avoid_print
+      print('[GemmaService] chatWithGaitContext INPUT '
+          '(sys=${sys.length} chars, user=${userText.length} chars, '
+          'history=${history.length})');
+      final prefillSw = Stopwatch()..start();
       await session.addQueryChunk(Message.text(text: sys, isUser: true));
       for (final m in trimHistory(history)) {
         final isUser = m['role'] == 'user';
@@ -413,9 +586,38 @@ class GemmaService {
         );
       }
       await session.addQueryChunk(Message.text(text: userText, isUser: true));
-      final response = await session.generateChatResponse();
-      final raw = response is TextResponse ? response.token : response.toString();
-      return _stripThink(raw);
+      prefillSw.stop();
+
+      final stats = LlmStats(inputChars: sys.length + userText.length);
+      final firstTokenSw = Stopwatch()..start();
+      final genSw = Stopwatch()..start();
+      final buf = StringBuffer();
+      await for (final r in session.generateChatResponseAsync()) {
+        if (r is TextResponse) {
+          if (firstTokenSw.isRunning) {
+            firstTokenSw.stop();
+            stats.firstTokenMs = firstTokenSw.elapsedMilliseconds;
+            stats.prefillMs =
+                prefillSw.elapsedMilliseconds + stats.firstTokenMs;
+            genSw
+              ..reset()
+              ..start();
+          }
+          buf.write(r.token);
+          stats.outputTokens++;
+          stats.generationMs = genSw.elapsedMilliseconds;
+        }
+      }
+      genSw.stop();
+      final reply = _stripThink(buf.toString());
+      stats.outputChars = reply.length;
+      lastStats = stats;
+      // ignore: avoid_print
+      print('[GemmaService] chatWithGaitContext OUTPUT '
+          '(${reply.length} chars): $reply');
+      // ignore: avoid_print
+      print('[GemmaService] chatWithGaitContext STATS ${stats.summary()}');
+      return reply;
     } finally {
       try {
         // ignore: avoid_dynamic_calls
@@ -1231,10 +1433,19 @@ class GaitChatSession {
   final Future<void> _warmupFuture;
   bool _disposed = false;
 
+  /// Stats from the most recent `ask` call. Surfaced in the chat UI's
+  /// assistant bubble so the patient (and developer) can see decode speed.
+  LlmStats? lastStats;
+
   /// Ask one question. Waits for the background warmup to finish on the very
   /// first call, then prefills only the new user message + previous reply —
-  /// the system prompt + gait context are already in the KV cache.
-  Future<String> ask(String userText) async {
+  /// the system prompt + gait context are already in the KV cache. Streams
+  /// the reply, optionally emitting partials via [onChunk]; populates
+  /// [lastStats] before returning.
+  Future<String> ask(
+    String userText, {
+    void Function(String partial, LlmStats stats)? onChunk,
+  }) async {
     if (_disposed) {
       throw StateError('GaitChatSession is closed');
     }
@@ -1242,10 +1453,52 @@ class GaitChatSession {
     // Block on the warmup prefill before the first user turn; on every later
     // turn this future is already complete so it's a no-op.
     await _warmupFuture;
+    // ignore: avoid_print
+    print('[GaitChatSession] ask INPUT (${userText.length} chars): $userText');
+    final prefillSw = Stopwatch()..start();
     await _chat.addQueryChunk(Message.text(text: userText, isUser: true));
-    final response = await _chat.generateChatResponse();
-    if (response is TextResponse) return GemmaService._stripThink(response.token);
-    return '';
+    prefillSw.stop();
+
+    final stats = LlmStats(inputChars: userText.length);
+    final firstTokenSw = Stopwatch()..start();
+    final genSw = Stopwatch()..start();
+    final buf = StringBuffer();
+    await for (final r in _chat.generateChatResponseAsync()) {
+      if (r is TextResponse) {
+        if (firstTokenSw.isRunning) {
+          firstTokenSw.stop();
+          stats.firstTokenMs = firstTokenSw.elapsedMilliseconds;
+          stats.prefillMs =
+              prefillSw.elapsedMilliseconds + stats.firstTokenMs;
+          genSw
+            ..reset()
+            ..start();
+        }
+        buf.write(r.token);
+        stats.outputTokens++;
+        stats.outputChars = buf.length;
+        stats.generationMs = genSw.elapsedMilliseconds;
+        if (stats.outputTokens % 3 == 0) {
+          onChunk?.call(buf.toString(), stats);
+        }
+      }
+    }
+    genSw.stop();
+    if (firstTokenSw.isRunning) {
+      firstTokenSw.stop();
+      stats.firstTokenMs = firstTokenSw.elapsedMilliseconds;
+      stats.prefillMs =
+          prefillSw.elapsedMilliseconds + stats.firstTokenMs;
+    }
+    final text = GemmaService._stripThink(buf.toString());
+    stats.outputChars = text.length;
+    lastStats = stats;
+    // ignore: avoid_print
+    print('[GaitChatSession] ask OUTPUT (${text.length} chars): $text');
+    // ignore: avoid_print
+    print('[GaitChatSession] ask STATS ${stats.summary()}');
+    onChunk?.call(text, stats);
+    return text;
   }
 
   Future<void> close() async {

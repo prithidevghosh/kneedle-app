@@ -1,5 +1,6 @@
 import '../data/exercise_library.dart';
 import '../gait/pipeline.dart';
+import '../services/gemma_stats.dart';
 
 /// Bilingual structured exercise prescription. 1:1 with `AnalysisResponse`
 /// in `kneedle-backend/models.py`. Produced by `GemmaService.analyseGait`.
@@ -19,7 +20,7 @@ class PrescribedExercise {
 }
 
 class AnalysisResponse {
-  const AnalysisResponse({
+  AnalysisResponse({
     required this.observation,
     required this.observationEn,
     required this.fixTitle,
@@ -53,7 +54,53 @@ class AnalysisResponse {
     this.clinicalFlags = const [],
     this.bilateralPatternDetected = false,
     this.primaryViewConfidence = 0,
+    this.stats,
   });
+
+  /// Telemetry from the Gemma generation call that produced this response —
+  /// populated by `GemmaService.analyseGait`, surfaced in the result UI's
+  /// tokens-per-second pill. Null for the hardcoded fallback path.
+  LlmStats? stats;
+
+  AnalysisResponse copyWith({LlmStats? stats}) {
+    final out = AnalysisResponse(
+      observation: observation,
+      observationEn: observationEn,
+      fixTitle: fixTitle,
+      fixDesc: fixDesc,
+      fixTitleEn: fixTitleEn,
+      fixDescEn: fixDescEn,
+      exercises: exercises,
+      activeJoint: activeJoint,
+      symmetryScore: symmetryScore,
+      sessionNumber: sessionNumber,
+      metrics: metrics,
+      thinking: thinking,
+      severity: severity,
+      symmetryBand: symmetryBand,
+      symmetryMeaning: symmetryMeaning,
+      symmetryMeaningEn: symmetryMeaningEn,
+      empathyLine: empathyLine,
+      empathyLineEn: empathyLineEn,
+      frequency: frequency,
+      frequencyEn: frequencyEn,
+      painRule: painRule,
+      painRuleEn: painRuleEn,
+      redFlags: redFlags,
+      redFlagsEn: redFlagsEn,
+      referralRecommended: referralRecommended,
+      referralText: referralText,
+      referralTextEn: referralTextEn,
+      complementaryActions: complementaryActions,
+      complementaryActionsEn: complementaryActionsEn,
+      klProxyGrade: klProxyGrade,
+      clinicalFlags: clinicalFlags,
+      bilateralPatternDetected: bilateralPatternDetected,
+      primaryViewConfidence: primaryViewConfidence,
+      stats: stats ?? this.stats,
+    );
+    return out;
+  }
 
   final String observation;
   final String observationEn;

@@ -232,6 +232,29 @@ class _RemindersScreenState extends ConsumerState<RemindersScreen> {
                           color: KneedleTheme.sageDeep,
                         ),
                       ),
+                      if (GemmaService.instance.lastStats != null) ...[
+                        const SizedBox(height: 8),
+                        Builder(builder: (_) {
+                          final s = GemmaService.instance.lastStats!;
+                          return Row(
+                            children: [
+                              const Icon(Icons.bolt_rounded,
+                                  size: 13, color: KneedleTheme.sageDeep),
+                              const SizedBox(width: 4),
+                              Text(
+                                '${s.tokensPerSecond.toStringAsFixed(1)} tok/s · '
+                                '${s.outputTokens} tok · ${s.totalMs}ms',
+                                style: const TextStyle(
+                                  fontSize: 11,
+                                  fontWeight: FontWeight.w600,
+                                  color: KneedleTheme.sageDeep,
+                                  letterSpacing: 0.3,
+                                ),
+                              ),
+                            ],
+                          );
+                        }),
+                      ],
                     ],
                   ],
                 ),

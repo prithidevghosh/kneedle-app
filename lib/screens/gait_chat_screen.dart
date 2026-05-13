@@ -145,6 +145,7 @@ class _GaitChatScreenState extends ConsumerState<GaitChatScreen> {
       setState(() => _turns.add(_Turn(
             userText: transcript,
             assistantText: reply,
+            stats: session.lastStats,
           )));
       _scrollToBottom();
       // Speak the reply but don't block the UI on it finishing — the user
@@ -207,7 +208,7 @@ class _GaitChatScreenState extends ConsumerState<GaitChatScreen> {
                     for (final t in _turns) ...[
                       _UserBubble(text: t.userText),
                       const SizedBox(height: KneedleTheme.space2),
-                      _AssistantBubble(text: t.assistantText),
+                      _AssistantBubble(text: t.assistantText, stats: t.stats),
                       const SizedBox(height: KneedleTheme.space4),
                     ],
                   if (_error != null) ...[
@@ -263,9 +264,14 @@ class _GaitChatScreenState extends ConsumerState<GaitChatScreen> {
 }
 
 class _Turn {
-  const _Turn({required this.userText, required this.assistantText});
+  const _Turn({
+    required this.userText,
+    required this.assistantText,
+    this.stats,
+  });
   final String userText;
   final String assistantText;
+  final LlmStats? stats;
 }
 
 class _ContextHeader extends StatelessWidget {
@@ -419,8 +425,9 @@ class _UserBubble extends StatelessWidget {
 }
 
 class _AssistantBubble extends StatelessWidget {
-  const _AssistantBubble({required this.text});
+  const _AssistantBubble({required this.text, this.stats});
   final String text;
+  final LlmStats? stats;
 
   @override
   Widget build(BuildContext context) {
@@ -481,9 +488,89 @@ class _AssistantBubble extends StatelessWidget {
                   color: KneedleTheme.ink,
                 ),
               ),
+              if (stats != null) ...[
+                const SizedBox(height: 8),
+                _GenerationStatsFooter(stats: stats!),
+              ],
             ],
           ),
         ),
+      ),
+    );
+  }
+}
+
+/// Footer pill row showing tokens, decode time, and tokens/sec for the
+/// reply just rendered. Same shape used on the gait result screen so the
+/// user (and a watching dev) can compare costs across screens at a glance.
+class _GenerationStatsFooter extends StatelessWidget {
+  const _GenerationStatsFooter({required this.stats});
+  final LlmStats stats;
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      children: [
+        _StatChip(
+          icon: Icons.bolt_rounded,
+          label: '${stats.tokensPerSecond.toStringAsFixed(1)} tok/s',
+          accent: KneedleTheme.sageDeep,
+          tint: KneedleTheme.sageTint,
+        ),
+        const SizedBox(width: 6),
+        _StatChip(
+          icon: Icons.text_snippet_rounded,
+          label: '${stats.outputTokens} tok',
+          accent: KneedleTheme.inkMuted,
+          tint: KneedleTheme.cream,
+        ),
+        const SizedBox(width: 6),
+        _StatChip(
+          icon: Icons.timer_outlined,
+          label: '${stats.totalMs}ms',
+          accent: KneedleTheme.inkMuted,
+          tint: KneedleTheme.cream,
+        ),
+      ],
+    );
+  }
+}
+
+class _StatChip extends StatelessWidget {
+  const _StatChip({
+    required this.icon,
+    required this.label,
+    required this.accent,
+    required this.tint,
+  });
+  final IconData icon;
+  final String label;
+  final Color accent;
+  final Color tint;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+      decoration: BoxDecoration(
+        color: tint,
+        borderRadius: BorderRadius.circular(99),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(icon, size: 12, color: accent),
+          const SizedBox(width: 4),
+          Text(
+            label,
+            style: TextStyle(
+              fontSize: 10,
+              fontWeight: FontWeight.w700,
+              color: accent,
+              letterSpacing: 0.3,
+            ),
+          ),
+        ],
       ),
     );
   }
