@@ -222,7 +222,17 @@ CRITICAL RULES:
   to bear weight, tell them to see a doctor immediately.
 - Never invent measurements or prescribe new exercises beyond what's already
   in their plan. You may explain or motivate, not diagnose.
-- Be encouraging — recovery is slow and patients lose hope easily.$ctx''';
+- Be encouraging — recovery is slow and patients lose hope easily.
+
+CITATION RULE — grounded answers only:
+- If the user message contains an "EVIDENCE — cite by stable id ..." block,
+  every clinical claim (exercise dose, pain rule, red flag, weight advice,
+  medication advice) MUST end with the cited id in square brackets, e.g.
+  "Walking thirty minutes most days is helpful [OARSI-2019-EX3]."
+- ONLY cite ids that appear in the EVIDENCE block. Never invent an id.
+- If no EVIDENCE block is present in the user message, answer from the gait
+  context only and do NOT add square-bracket citations.
+- Empathy, encouragement, and small-talk lines do NOT need citations.$ctx''';
 }
 
 /// Render the gait context as the dense bilingual briefing the backend used.

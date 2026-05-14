@@ -6,6 +6,7 @@ import '../core/theme.dart';
 import '../models/gait_session.dart';
 import '../providers/providers.dart';
 import '../widgets/widgets.dart';
+import 'agent_screen.dart';
 import 'exercise_coach_screen.dart';
 import 'gait_capture_screen.dart';
 import 'pain_journal_screen.dart';
@@ -55,11 +56,20 @@ class HomeScreen extends ConsumerWidget {
                   ),
                   const SizedBox(height: KneedleTheme.space4),
                   _PrimaryAction(
+                    title: 'Hey Kneedle — talk to me',
+                    subtitle: 'Speak. Gemma 4 does the rest.',
+                    icon: Icons.auto_awesome_rounded,
+                    accent: KneedleTheme.sage,
+                    accentSoft: KneedleTheme.sageTint,
+                    onTap: () => routeToAgent(context),
+                  ),
+                  const SizedBox(height: KneedleTheme.space3),
+                  _PrimaryAction(
                     title: 'Run a gait check',
                     subtitle: '8-second walk · on-device analysis',
                     icon: Icons.directions_walk_rounded,
-                    accent: KneedleTheme.sage,
-                    accentSoft: KneedleTheme.sageTint,
+                    accent: KneedleTheme.amber,
+                    accentSoft: KneedleTheme.amberTint,
                     onTap: () => Navigator.of(context).push(
                       MaterialPageRoute(
                         builder: (_) => const GaitCaptureScreen(),

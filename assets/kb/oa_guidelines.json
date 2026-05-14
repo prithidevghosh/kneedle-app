@@ -1,0 +1,206 @@
+{
+  "version": "2026-05-14",
+  "license": "Curated paraphrase. OARSI 2019 / NICE NG226 / WHO content is publicly available; passages here are written by the Kneedle team for accessibility and lay-readability.",
+  "chunks": [
+    {
+      "id": "OARSI-2019-EX1",
+      "source": "OARSI",
+      "section": "Non-surgical management of knee OA, 2019",
+      "title": "Land-based exercise is a core treatment",
+      "text": "Regular land-based exercise (walking, strengthening, neuromuscular training) is strongly recommended for knee osteoarthritis. Benefits build over 4-8 weeks of consistent practice. Start gently; increase load only when pain stays under 5/10 during and after activity.",
+      "url": "https://www.oarsi.org/research/guidelines"
+    },
+    {
+      "id": "OARSI-2019-EX2",
+      "source": "OARSI",
+      "section": "Non-surgical management of knee OA, 2019",
+      "title": "Strengthen the quadriceps",
+      "text": "Quadriceps strengthening is a foundational treatment for knee OA. Isometric work (quad sets) is safe even when pain is high; progress to seated knee extensions and mini-squats as pain allows.",
+      "url": "https://www.oarsi.org/research/guidelines"
+    },
+    {
+      "id": "OARSI-2019-EX3",
+      "source": "OARSI",
+      "section": "Non-surgical management of knee OA, 2019",
+      "title": "Walking dose",
+      "text": "30 minutes of moderate-pace walking on most days is appropriate for most people with mild-to-moderate knee OA. Split into 10-minute bouts if continuous walking provokes pain.",
+      "url": "https://www.oarsi.org/research/guidelines"
+    },
+    {
+      "id": "OARSI-2019-AQ1",
+      "source": "OARSI",
+      "section": "Non-surgical management of knee OA, 2019",
+      "title": "Aquatic exercise for severe pain",
+      "text": "Aquatic (pool) exercise is conditionally recommended when land-based exercise is too painful. Water offloads about 70-90 percent of body weight at chest depth, allowing range-of-motion work without joint loading.",
+      "url": "https://www.oarsi.org/research/guidelines"
+    },
+    {
+      "id": "OARSI-2019-WT1",
+      "source": "OARSI",
+      "section": "Non-surgical management of knee OA, 2019",
+      "title": "Weight loss helps load-bearing joints",
+      "text": "Losing 5 to 10 percent of body weight measurably reduces knee pain and improves function in people with OA who are above their ideal weight. Each kilogram lost removes about four kilograms of force per step from the knee.",
+      "url": "https://www.oarsi.org/research/guidelines"
+    },
+    {
+      "id": "OARSI-2019-RF1",
+      "source": "OARSI",
+      "section": "Non-surgical management of knee OA, 2019",
+      "title": "Sudden swelling plus fever is urgent",
+      "text": "Sudden joint swelling, especially with fever or heat over the joint, can indicate infection (septic arthritis) and requires same-day medical assessment. This is not typical of osteoarthritis.",
+      "url": "https://www.oarsi.org/research/guidelines"
+    },
+    {
+      "id": "OARSI-2019-RF3",
+      "source": "OARSI",
+      "section": "Non-surgical management of knee OA, 2019",
+      "title": "Pain at 8/10 or above persisting is a referral signal",
+      "text": "OA pain that remains at 8/10 or above for several days despite rest and analgesia, or worsens steadily over a week, warrants prompt clinician review to reconsider treatment.",
+      "url": "https://www.oarsi.org/research/guidelines"
+    },
+    {
+      "id": "OARSI-2019-HEAT",
+      "source": "OARSI",
+      "section": "Non-surgical management of knee OA, 2019",
+      "title": "Heat and cold",
+      "text": "Heat (15 minutes, warm not hot) helps stiff joints and warms muscles before exercise. Cold (15 minutes, wrapped) helps a swollen or freshly painful joint. Both are short-term symptom management, not a cure.",
+      "url": "https://www.oarsi.org/research/guidelines"
+    },
+    {
+      "id": "OARSI-2019-BRACE",
+      "source": "OARSI",
+      "section": "Non-surgical management of knee OA, 2019",
+      "title": "Knee sleeves and braces",
+      "text": "Knee sleeves can reduce pain through warmth and proprioception. Unloader braces (for medial OA) shift load away from the painful compartment. A simple sleeve is reasonable to try; rigid braces should be fitted by a clinician.",
+      "url": "https://www.oarsi.org/research/guidelines"
+    },
+    {
+      "id": "NICE-NG226-1.5",
+      "source": "NICE",
+      "section": "NG226 §1.5 - Referral for specialist assessment",
+      "title": "When to refer to specialist services",
+      "text": "Refer to a specialist if the person has joint symptoms that have a substantial impact on quality of life and are refractory to non-surgical treatment, if they cannot bear weight, if the knee locks or gives way frequently, or if there is sudden swelling with systemic symptoms.",
+      "url": "https://www.nice.org.uk/guidance/ng226"
+    },
+    {
+      "id": "NICE-NG226-1.2",
+      "source": "NICE",
+      "section": "NG226 §1.2 - Information and support",
+      "title": "OA is manageable, not curable",
+      "text": "Osteoarthritis is a long-term condition managed by exercise, weight management, and symptom control. There is currently no medicine or supplement that reverses cartilage loss. Most people maintain a good quality of life with consistent self-management.",
+      "url": "https://www.nice.org.uk/guidance/ng226"
+    },
+    {
+      "id": "NICE-NG226-1.4",
+      "source": "NICE",
+      "section": "NG226 §1.4 - Pharmacological management",
+      "title": "Topical NSAIDs first",
+      "text": "For knee OA, topical NSAID gels (e.g. ibuprofen or diclofenac applied to the skin over the joint) are recommended before oral painkillers, because they reduce systemic side effects in older adults. Discuss with a pharmacist or doctor first.",
+      "url": "https://www.nice.org.uk/guidance/ng226"
+    },
+    {
+      "id": "NICE-NG226-EX",
+      "source": "NICE",
+      "section": "NG226 §1.3 - Exercise",
+      "title": "Exercise is recommended regardless of severity",
+      "text": "Therapeutic exercise should be offered as a core treatment for everyone with osteoarthritis, regardless of age, comorbidity, pain severity or disability. Benefits include reduced pain and improved physical function.",
+      "url": "https://www.nice.org.uk/guidance/ng226"
+    },
+    {
+      "id": "NICE-NG226-WALK",
+      "source": "NICE",
+      "section": "NG226 §1.3 - Exercise",
+      "title": "Aids and walking sticks",
+      "text": "A walking stick used in the opposite hand to the painful knee can reduce knee load by 20-25 percent. It is a sign of self-care, not weakness, and is recommended for episodes of higher pain.",
+      "url": "https://www.nice.org.uk/guidance/ng226"
+    },
+    {
+      "id": "NICE-NG226-SLEEP",
+      "source": "NICE",
+      "section": "NG226 §1.2 - Information and support",
+      "title": "Nocturnal pain",
+      "text": "Pain that wakes you at night, or pain when resting, is less typical of mechanical OA and should be discussed with a clinician. It may indicate inflammatory disease, a flare, or a need to reconsider treatment.",
+      "url": "https://www.nice.org.uk/guidance/ng226"
+    },
+    {
+      "id": "BMJ-2018-LOCK",
+      "source": "BMJ",
+      "section": "BMJ Best Practice - Knee assessment, 2018",
+      "title": "Locking or giving way needs a knee exam",
+      "text": "A knee that locks (cannot fully straighten), catches, or gives way during walking suggests a mechanical problem such as a loose body or meniscal tear, distinct from OA itself. An in-person knee examination is recommended.",
+      "url": "https://bestpractice.bmj.com/"
+    },
+    {
+      "id": "OARSI-2019-PAIN-RULE",
+      "source": "OARSI",
+      "section": "Non-surgical management of knee OA, 2019",
+      "title": "The two-hour rule",
+      "text": "Exercise that causes pain above 5/10, or pain that lasts more than two hours after the session, is too intense. Reduce repetitions or range until the pain settles back to baseline before the next session.",
+      "url": "https://www.oarsi.org/research/guidelines"
+    },
+    {
+      "id": "OARSI-2019-FLARE",
+      "source": "OARSI",
+      "section": "Non-surgical management of knee OA, 2019",
+      "title": "Handling a flare",
+      "text": "During a flare (sudden increase in pain), reduce exercise intensity but do not stop completely. Maintain isometric quad sets and gentle range-of-motion. Resume normal load gradually over 3-5 days.",
+      "url": "https://www.oarsi.org/research/guidelines"
+    },
+    {
+      "id": "WHO-OA-PREV",
+      "source": "WHO",
+      "section": "WHO Musculoskeletal conditions fact sheet",
+      "title": "OA prevalence in older adults",
+      "text": "Osteoarthritis affects roughly 1 in 5 adults over 60 worldwide. Women are affected more than men. It is the single largest cause of mobility-related disability in older adults globally.",
+      "url": "https://www.who.int/news-room/fact-sheets/detail/musculoskeletal-conditions"
+    },
+    {
+      "id": "OARSI-2019-PSYCH",
+      "source": "OARSI",
+      "section": "Non-surgical management of knee OA, 2019",
+      "title": "Mood and pain are linked",
+      "text": "Low mood and sleep loss make OA pain feel worse. Treating depression, anxiety, and sleep difficulties is part of OA care, not separate from it.",
+      "url": "https://www.oarsi.org/research/guidelines"
+    },
+    {
+      "id": "OARSI-2019-INJECT",
+      "source": "OARSI",
+      "section": "Non-surgical management of knee OA, 2019",
+      "title": "Steroid injections - short-term relief",
+      "text": "Intra-articular corticosteroid injections can give 2-4 weeks of pain relief during a severe flare, but provide no long-term benefit and may damage cartilage if repeated frequently. They are a tool, not a routine.",
+      "url": "https://www.oarsi.org/research/guidelines"
+    },
+    {
+      "id": "OARSI-2019-SUPP",
+      "source": "OARSI",
+      "section": "Non-surgical management of knee OA, 2019",
+      "title": "Glucosamine and chondroitin",
+      "text": "OARSI gives no strong recommendation for glucosamine or chondroitin supplements for knee OA. Evidence is mixed and any benefit is small. They are safe to try if affordable, but do not replace exercise and weight management.",
+      "url": "https://www.oarsi.org/research/guidelines"
+    },
+    {
+      "id": "OARSI-2019-SHOES",
+      "source": "OARSI",
+      "section": "Non-surgical management of knee OA, 2019",
+      "title": "Footwear matters",
+      "text": "Cushioned, well-fitted walking shoes reduce knee impact at heel strike. Heels above 3 cm and worn-out soles increase knee load and should be avoided during flares.",
+      "url": "https://www.oarsi.org/research/guidelines"
+    },
+    {
+      "id": "OARSI-2019-GAIT-ASYM",
+      "source": "OARSI",
+      "section": "Non-surgical management of knee OA, 2019",
+      "title": "Asymmetric gait protects the painful knee but loads the other",
+      "text": "Limping or favouring one knee shifts load to the other side, which over months can accelerate OA in the previously healthy knee. Symmetry-focused gait retraining is a recognised treatment.",
+      "url": "https://www.oarsi.org/research/guidelines"
+    },
+    {
+      "id": "OARSI-2019-TRUNK-LEAN",
+      "source": "OARSI",
+      "section": "Non-surgical management of knee OA, 2019",
+      "title": "Lateral trunk lean reduces knee load",
+      "text": "Leaning the trunk slightly toward the painful side during stance phase reduces the knee adduction moment by 10-20 percent. It is a known compensatory pattern; a physiotherapist can teach it deliberately when appropriate.",
+      "url": "https://www.oarsi.org/research/guidelines"
+    }
+  ]
+}

@@ -9,6 +9,7 @@ import '../clinical/safety_defaults.dart';
 import '../clinical/severity.dart';
 import '../data/exercise_library.dart';
 import '../gait/pipeline.dart';
+import '../kb/retriever.dart';
 import '../models/analysis_response.dart';
 import '../models/appointment.dart';
 import '../models/medication.dart';
@@ -198,6 +199,7 @@ class GemmaService {
 
   Future<String> chat(String userText) async {
     _ensure();
+    lastToolCalls.clear();
     // ignore: avoid_print
     print('[GemmaService] chat INPUT (${userText.length} chars): $userText');
     final sw = Stopwatch()..start();
@@ -752,6 +754,35 @@ class GemmaService {
         'required': ['title'],
       },
     ),
+    Tool(
+      name: 'start_gait_test',
+      description:
+          'Launch the on-device walking analysis. Use when the user wants '
+          'to "do a gait check", "run a walk test", "check how I walk", or '
+          'similar. Takes no arguments.',
+      parameters: {'type': 'object', 'properties': {}},
+    ),
+    Tool(
+      name: 'show_history',
+      description:
+          "Open the patient's trends / history view. Use when they ask "
+          '"how have I been", "show my history", "show my pain trend", '
+          'or want to see past results. `weeks` defaults to 4.',
+      parameters: {
+        'type': 'object',
+        'properties': {
+          'weeks': {'type': 'integer', 'minimum': 1, 'maximum': 12},
+        },
+      },
+    ),
+    Tool(
+      name: 'generate_doctor_report',
+      description:
+          'Build a clinician-ready PDF of the recent pain, gait, and '
+          'exercise history. Use when the user wants to "share with my '
+          'doctor", "make a report", "export for the doctor".',
+      parameters: {'type': 'object', 'properties': {}},
+    ),
   ];
 
   /// Tools whose `acknowledgement` string is already user-ready. After these
@@ -766,7 +797,17 @@ class GemmaService {
     'add_appointment',
     'remove_medication',
     'remove_appointment',
+    'start_gait_test',
+    'show_history',
+    'generate_doctor_report',
   };
+
+  /// One entry per tool call made during the most recent `chat()` /
+  /// `extractPainEntry()` round-trip. Cleared at the start of each call.
+  /// Read by `AgentScreen` to render the tool-execution timeline and to
+  /// dispatch any navigation intents (start_gait_test, show_history,
+  /// generate_doctor_report) after the modal closes.
+  final List<AgentToolCall> lastToolCalls = [];
 
   Future<String> _handleResponse(
     ModelResponse response, {
@@ -779,6 +820,11 @@ class GemmaService {
         args: response.args,
         originalUserText: originalUserText,
       );
+      lastToolCalls.add(AgentToolCall(
+        name: response.name,
+        args: Map<String, Object?>.from(response.args),
+        result: Map<String, Object?>.from(toolResult),
+      ));
       // Buffer the tool response into the chat so the next user turn has
       // full context, but skip the follow-up generate for terminal tools —
       // their `acknowledgement` is already a complete, user-facing sentence
@@ -1035,6 +1081,34 @@ class GemmaService {
               'Removed: ${apptTarget.title} on '
               '${_formatDate(apptTarget.when)} at '
               '${_formatWhen(apptTarget.when)}.',
+        };
+
+      case 'start_gait_test':
+        return {
+          'ok': true,
+          'nav': 'gait_capture',
+          'acknowledgement':
+              "Opening the walking test — stand 8 feet from the camera "
+              'and tap start when you\'re ready.',
+        };
+
+      case 'show_history':
+        final weeks = ((args['weeks'] as num?)?.toInt() ?? 4).clamp(1, 12);
+        return {
+          'ok': true,
+          'nav': 'history',
+          'weeks': weeks,
+          'acknowledgement':
+              'Opening your $weeks-week trend view.',
+        };
+
+      case 'generate_doctor_report':
+        return {
+          'ok': true,
+          'nav': 'doctor_report',
+          'acknowledgement':
+              'Building your doctor report — you can share it from the '
+              'next screen.',
         };
 
       default:
@@ -1422,6 +1496,34 @@ class GemmaService {
 /// [GemmaService.openGaitChat] — owns an [InferenceChat] that lives for the
 /// duration of the gait-result Q&A screen. Call [close] on screen dispose to
 /// release the underlying KV cache (~150–250 MB on Gemma 4 E2B INT4).
+/// One executed function call, captured for the Agent screen's tool timeline.
+/// Plain data — never holds references to Gemma internals or UI state.
+class AgentToolCall {
+  AgentToolCall({
+    required this.name,
+    required this.args,
+    required this.result,
+  });
+
+  /// Tool name as defined in `_toolDefinitions` (e.g. `record_pain_entry`).
+  final String name;
+
+  /// Args the model emitted. Already de-typed to `Map<String, Object?>`.
+  final Map<String, Object?> args;
+
+  /// Dispatcher result. Reliable fields:
+  ///   * `ok` (bool) — true on success.
+  ///   * `acknowledgement` (String?) — user-facing one-line summary.
+  ///   * `nav` (String?) — set by navigation-intent tools
+  ///     (`start_gait_test` → 'gait_capture', `show_history` → 'history',
+  ///     `generate_doctor_report` → 'doctor_report').
+  final Map<String, Object?> result;
+
+  bool get ok => result['ok'] == true;
+  String? get acknowledgement => result['acknowledgement'] as String?;
+  String? get nav => result['nav'] as String?;
+}
+
 class GaitChatSession {
   GaitChatSession._({
     required InferenceChat chat,
@@ -1437,11 +1539,24 @@ class GaitChatSession {
   /// assistant bubble so the patient (and developer) can see decode speed.
   LlmStats? lastStats;
 
+  /// Last retrieval result for the most recent `ask` call. The chat UI reads
+  /// this to render the citation chips below the assistant bubble. Reset on
+  /// every call; empty result on a query the retriever doesn't hit.
+  KbRetrievalResult lastRetrieval = const KbRetrievalResult(
+    hits: [],
+    evidenceBlock: '',
+  );
+
   /// Ask one question. Waits for the background warmup to finish on the very
   /// first call, then prefills only the new user message + previous reply —
   /// the system prompt + gait context are already in the KV cache. Streams
   /// the reply, optionally emitting partials via [onChunk]; populates
   /// [lastStats] before returning.
+  ///
+  /// RAG: before sending the user turn we run [Retriever.retrieve] over the
+  /// raw question; any hits are spliced into the prompt as an EVIDENCE block
+  /// that the system prompt's citation rule references. On miss we send the
+  /// user text verbatim and the model answers without citations.
   Future<String> ask(
     String userText, {
     void Function(String partial, LlmStats stats)? onChunk,
@@ -1453,10 +1568,18 @@ class GaitChatSession {
     // Block on the warmup prefill before the first user turn; on every later
     // turn this future is already complete so it's a no-op.
     await _warmupFuture;
+
+    final retrieval = Retriever.retrieve(userText, k: 3);
+    lastRetrieval = retrieval;
+    final composed = retrieval.isEmpty
+        ? userText
+        : '${retrieval.evidenceBlock}\n\nPATIENT ASKS:\n$userText';
     // ignore: avoid_print
-    print('[GaitChatSession] ask INPUT (${userText.length} chars): $userText');
+    print('[GaitChatSession] ask INPUT (${userText.length} chars, '
+        'evidence=${retrieval.hits.length}): $userText');
+
     final prefillSw = Stopwatch()..start();
-    await _chat.addQueryChunk(Message.text(text: userText, isUser: true));
+    await _chat.addQueryChunk(Message.text(text: composed, isUser: true));
     prefillSw.stop();
 
     final stats = LlmStats(inputChars: userText.length);

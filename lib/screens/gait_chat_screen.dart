@@ -3,6 +3,8 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:permission_handler/permission_handler.dart';
 
 import '../core/theme.dart';
+import '../kb/kb_index.dart';
+import '../kb/retriever.dart';
 import '../models/analysis_response.dart';
 import '../providers/providers.dart';
 import '../services/gemma_service.dart';
@@ -146,6 +148,7 @@ class _GaitChatScreenState extends ConsumerState<GaitChatScreen> {
             userText: transcript,
             assistantText: reply,
             stats: session.lastStats,
+            citations: session.lastRetrieval.hits,
           )));
       _scrollToBottom();
       // Speak the reply but don't block the UI on it finishing — the user
@@ -208,7 +211,11 @@ class _GaitChatScreenState extends ConsumerState<GaitChatScreen> {
                     for (final t in _turns) ...[
                       _UserBubble(text: t.userText),
                       const SizedBox(height: KneedleTheme.space2),
-                      _AssistantBubble(text: t.assistantText, stats: t.stats),
+                      _AssistantBubble(
+                        text: t.assistantText,
+                        stats: t.stats,
+                        citations: t.citations,
+                      ),
                       const SizedBox(height: KneedleTheme.space4),
                     ],
                   if (_error != null) ...[
@@ -268,10 +275,12 @@ class _Turn {
     required this.userText,
     required this.assistantText,
     this.stats,
+    this.citations = const [],
   });
   final String userText;
   final String assistantText;
   final LlmStats? stats;
+  final List<KbHit> citations;
 }
 
 class _ContextHeader extends StatelessWidget {
@@ -386,6 +395,154 @@ class _SuggestionList extends StatelessWidget {
   }
 }
 
+/// Source-citation chip row. One pill per retrieved chunk; tap → bottom
+/// sheet with the full passage and a copy-link button. The chip carries the
+/// source ("OARSI") and the title so the user can recognise it at a glance
+/// without reading the full ID.
+class _CitationChips extends StatelessWidget {
+  const _CitationChips({required this.chunks});
+  final List<KbChunk> chunks;
+
+  void _show(BuildContext context, KbChunk c) {
+    showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.white,
+      builder: (_) => _SourceSheet(chunk: c),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Wrap(
+      spacing: 6,
+      runSpacing: 6,
+      children: [
+        for (final c in chunks)
+          InkWell(
+            onTap: () => _show(context, c),
+            borderRadius: BorderRadius.circular(99),
+            child: Container(
+              padding:
+                  const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+              decoration: BoxDecoration(
+                color: KneedleTheme.sageSoft,
+                borderRadius: BorderRadius.circular(99),
+                border: Border.all(
+                  color: KneedleTheme.sage.withValues(alpha: 0.25),
+                ),
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Icon(
+                    Icons.menu_book_rounded,
+                    size: 12,
+                    color: KneedleTheme.sageDeep,
+                  ),
+                  const SizedBox(width: 5),
+                  Text(
+                    '${c.source} · ${c.title}',
+                    style: const TextStyle(
+                      fontSize: 11.5,
+                      fontWeight: FontWeight.w600,
+                      color: KneedleTheme.sageDeep,
+                      letterSpacing: 0.1,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+      ],
+    );
+  }
+}
+
+class _SourceSheet extends StatelessWidget {
+  const _SourceSheet({required this.chunk});
+  final KbChunk chunk;
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: EdgeInsets.fromLTRB(
+        KneedleTheme.space5,
+        KneedleTheme.space4,
+        KneedleTheme.space5,
+        KneedleTheme.space5 + MediaQuery.of(context).viewInsets.bottom,
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Row(
+            children: [
+              Container(
+                padding: const EdgeInsets.symmetric(
+                    horizontal: 10, vertical: 4),
+                decoration: BoxDecoration(
+                  color: KneedleTheme.sageTint,
+                  borderRadius: BorderRadius.circular(99),
+                ),
+                child: Text(
+                  chunk.source,
+                  style: const TextStyle(
+                    fontSize: 11,
+                    fontWeight: FontWeight.w700,
+                    color: KneedleTheme.sageDeep,
+                    letterSpacing: 0.8,
+                  ),
+                ),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  chunk.section,
+                  style: const TextStyle(
+                    fontSize: 12,
+                    fontWeight: FontWeight.w600,
+                    color: KneedleTheme.inkMuted,
+                  ),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: KneedleTheme.space3),
+          Text(
+            chunk.title,
+            style: Theme.of(context).textTheme.titleLarge,
+          ),
+          const SizedBox(height: KneedleTheme.space3),
+          Text(
+            chunk.text,
+            style: const TextStyle(
+              fontSize: 15,
+              height: 1.55,
+              color: KneedleTheme.ink,
+            ),
+          ),
+          const SizedBox(height: KneedleTheme.space4),
+          Text(
+            'Reference id: ${chunk.id}',
+            style: const TextStyle(
+              fontSize: 11,
+              fontFamily: 'monospace',
+              color: KneedleTheme.inkFaint,
+              letterSpacing: 0.5,
+            ),
+          ),
+          const SizedBox(height: KneedleTheme.space4),
+          OutlinedButton.icon(
+            onPressed: () => Navigator.of(context).pop(),
+            icon: const Icon(Icons.check_rounded),
+            label: const Text('Close'),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 class _UserBubble extends StatelessWidget {
   const _UserBubble({required this.text});
   final String text;
@@ -425,12 +582,34 @@ class _UserBubble extends StatelessWidget {
 }
 
 class _AssistantBubble extends StatelessWidget {
-  const _AssistantBubble({required this.text, this.stats});
+  const _AssistantBubble({
+    required this.text,
+    this.stats,
+    this.citations = const [],
+  });
   final String text;
   final LlmStats? stats;
+  final List<KbHit> citations;
+
+  /// Strip square-bracket citation tokens from the rendered prose. The chips
+  /// below the bubble carry the same information visually, so the inline
+  /// `[ID]` markers would just be noise. We keep them in the model's KV
+  /// cache (so next turn sees its own previous citation behaviour) and only
+  /// hide them at render time.
+  static final _citationToken = RegExp(r'\s*\[[A-Z][A-Z0-9\-]+\]');
 
   @override
   Widget build(BuildContext context) {
+    // Filter: render chips ONLY for ids that actually exist in the KB. The
+    // model can't fabricate a citation because the system prompt restricts
+    // ids to the EVIDENCE block, but we double-check at render time.
+    final known = Retriever.knownIds;
+    final chips = [
+      for (final h in citations)
+        if (known.contains(h.chunk.id)) h.chunk,
+    ];
+    final visibleText = text.replaceAll(_citationToken, '').trim();
+
     return Align(
       alignment: Alignment.centerLeft,
       child: ConstrainedBox(
@@ -481,13 +660,17 @@ class _AssistantBubble extends StatelessWidget {
               ),
               const SizedBox(height: 6),
               Text(
-                text,
+                visibleText,
                 style: const TextStyle(
                   fontSize: 15,
                   height: 1.5,
                   color: KneedleTheme.ink,
                 ),
               ),
+              if (chips.isNotEmpty) ...[
+                const SizedBox(height: 10),
+                _CitationChips(chunks: chips),
+              ],
               if (stats != null) ...[
                 const SizedBox(height: 8),
                 _GenerationStatsFooter(stats: stats!),

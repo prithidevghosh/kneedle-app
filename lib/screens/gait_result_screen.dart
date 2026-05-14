@@ -3,17 +3,20 @@ import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../clinical/red_flags.dart';
 import '../core/theme.dart';
 import '../models/analysis_response.dart';
 import '../models/gait_session.dart';
 import '../models/pain_entry.dart';
 import '../providers/providers.dart';
 import '../services/gemma_service.dart';
+import '../services/storage_service.dart';
 import '../widgets/widgets.dart';
 import 'doctor_report_screen.dart';
 import 'gait_chat_screen.dart';
+import 'red_flag_screen.dart';
 
-class GaitResultScreen extends ConsumerWidget {
+class GaitResultScreen extends ConsumerStatefulWidget {
   const GaitResultScreen({
     super.key,
     required this.response,
@@ -23,7 +26,46 @@ class GaitResultScreen extends ConsumerWidget {
   final String lang;
 
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
+  ConsumerState<GaitResultScreen> createState() => _GaitResultScreenState();
+}
+
+class _GaitResultScreenState extends ConsumerState<GaitResultScreen> {
+  bool _redFlagChecked = false;
+
+  @override
+  void initState() {
+    super.initState();
+    // Defer one frame so navigation completes before we potentially push
+    // the interstitial — avoids the "pushing during build" lint.
+    WidgetsBinding.instance.addPostFrameCallback((_) => _checkRedFlags());
+  }
+
+  Future<void> _checkRedFlags() async {
+    if (_redFlagChecked || !mounted) return;
+    _redFlagChecked = true;
+    final r = widget.response;
+    final angleDiff = (r.metrics.kneeAngleRight != null &&
+            r.metrics.kneeAngleLeft != null)
+        ? (r.metrics.kneeAngleRight! - r.metrics.kneeAngleLeft!).abs()
+        : null;
+    final flags = detectRedFlags(RedFlagContext(
+      recentPain: StorageService.recentPainEntries(limit: 10),
+      latestSeverity: r.severity.toLowerCase(),
+      latestSymmetry: r.symmetryScore,
+      kneeAngleDiff: angleDiff,
+    ));
+    final urgent =
+        flags.where((f) => f.level == RedFlagLevel.urgent).toList();
+    if (urgent.isEmpty || !mounted) return;
+    await RedFlagScreen.route(context, flags: urgent);
+  }
+
+  AnalysisResponse get response => widget.response;
+  String get lang => widget.lang;
+
+  @override
+  Widget build(BuildContext context) {
+    final ref = this.ref;
     final sev = response.severity.toLowerCase();
     final (gradFrom, gradTo, accent) = switch (sev) {
       'severe' => (
@@ -64,6 +106,8 @@ class GaitResultScreen extends ConsumerWidget {
           ),
           physics: const BouncingScrollPhysics(),
           children: [
+            const SafetyBanner(),
+            const SizedBox(height: KneedleTheme.space3),
             if (response.stats != null) ...[
               _GenStatsBar(stats: response.stats!),
               const SizedBox(height: KneedleTheme.space3),

@@ -3,11 +3,13 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:intl/intl.dart';
 import 'package:permission_handler/permission_handler.dart';
 
+import '../clinical/red_flags.dart';
 import '../core/theme.dart';
 import '../models/pain_entry.dart';
 import '../providers/providers.dart';
 import '../services/storage_service.dart';
 import '../widgets/widgets.dart';
+import 'red_flag_screen.dart';
 
 class PainJournalScreen extends ConsumerStatefulWidget {
   const PainJournalScreen({super.key});
@@ -53,6 +55,9 @@ class _PainJournalScreenState extends ConsumerState<PainJournalScreen> {
           _lastReply = turn.reply;
         }
       });
+      if (turn.transcript.isNotEmpty && mounted) {
+        await _maybeInterruptForRedFlags(transcript: turn.transcript);
+      }
     } catch (e) {
       setState(() {
         _heading = 'Voice error';
@@ -93,6 +98,7 @@ class _PainJournalScreenState extends ConsumerState<PainJournalScreen> {
           ),
           physics: const BouncingScrollPhysics(),
           children: [
+            const SafetyBanner(),
             const SizedBox(height: KneedleTheme.space5),
             Center(
               child: KMicButton(
@@ -203,6 +209,33 @@ class _PainJournalScreenState extends ConsumerState<PainJournalScreen> {
       timestamp: now,
     ));
     bumpData(ref);
+    if (mounted) await _maybeInterruptForRedFlags();
+  }
+
+  /// Build a [RedFlagContext] from current Hive state + optional voice
+  /// transcript and push [RedFlagScreen] only if an urgent flag fires.
+  /// Save-then-check ordering matters: the entry is already persisted by the
+  /// caller, so even if the user dismisses the interstitial nothing is lost.
+  Future<void> _maybeInterruptForRedFlags({String? transcript}) async {
+    final recentPain = StorageService.recentPainEntries(limit: 10);
+    final gait = StorageService.recentGaitSessions(limit: 1);
+    final latest = gait.isEmpty ? null : gait.first;
+    final angleDiff = (latest?.kneeAngleRight != null &&
+            latest?.kneeAngleLeft != null)
+        ? (latest!.kneeAngleRight! - latest.kneeAngleLeft!).abs()
+        : null;
+    final flags = detectRedFlags(RedFlagContext(
+      recentPain: recentPain,
+      latestSeverity: latest?.severity.toLowerCase(),
+      latestSymmetry: latest?.symmetryScore,
+      kneeAngleDiff: angleDiff,
+      chatText: transcript,
+    ));
+    if (!mounted) return;
+    final urgent =
+        flags.where((f) => f.level == RedFlagLevel.urgent).toList();
+    if (urgent.isEmpty) return;
+    await RedFlagScreen.route(context, flags: urgent);
   }
 }
 
