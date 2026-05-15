@@ -8,6 +8,7 @@ import '../models/gait_session.dart';
 import '../models/pain_entry.dart';
 import '../providers/providers.dart';
 import '../widgets/widgets.dart';
+import 'home_screen.dart' show openSavedGaitReport;
 
 class HistoryScreen extends ConsumerStatefulWidget {
   const HistoryScreen({super.key});
@@ -315,6 +316,7 @@ class _GaitRow extends StatelessWidget {
     };
 
     return KCard(
+      onTap: () => openSavedGaitReport(context, session),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [

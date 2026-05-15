@@ -280,6 +280,12 @@ class VoiceService {
 
   /// Stop the current manual session and return the transcript heard so far.
   /// Safe to call even if [startListening] was never invoked.
+  ///
+  /// Android's recognizer flushes its final partial slightly after `stop()`
+  /// returns — without the short delay below we'd read `_manualTranscript`
+  /// before the platform has a chance to emit the last 1-2 words, and the
+  /// user's utterance gets clipped. 600 ms is long enough for ~99 % of
+  /// devices we tested and short enough to feel responsive.
   Future<String> stopAndCollect() async {
     final completer = _manualCompleter;
     if (completer == null) return '';
@@ -287,6 +293,7 @@ class VoiceService {
     _manualGuard?.cancel();
     _manualGuard = null;
     await _stt.stop();
+    await Future<void>.delayed(const Duration(milliseconds: 600));
     if (!completer.isCompleted) completer.complete(_manualTranscript);
     final out = await completer.future;
     return out.trim();

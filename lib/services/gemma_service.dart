@@ -813,38 +813,221 @@ class GemmaService {
     ModelResponse response, {
     required String originalUserText,
   }) async {
-    if (response is TextResponse) return _stripThink(response.token);
+    if (response is TextResponse) {
+      final stripped = _stripThink(response.token);
+      // Workaround for flutter_gemma 0.15.1 + Gemma 4: native function calls
+      // leak through as raw `<|tool_call>call:NAME{...}` markup inside a
+      // TextResponse instead of being parsed into a FunctionCallResponse.
+      // We detect that markup here and route through the existing tool
+      // dispatcher so the user sees the same outcome as the well-typed path.
+      final inline = _parseInlineToolCall(stripped);
+      if (inline != null) {
+        return _runInlineToolCall(
+          name: inline.name,
+          args: inline.args,
+          originalUserText: originalUserText,
+        );
+      }
+      return stripped;
+    }
     if (response is FunctionCallResponse) {
-      final toolResult = await _dispatchTool(
-        name: response.name,
-        args: response.args,
-        originalUserText: originalUserText,
-      );
-      lastToolCalls.add(AgentToolCall(
+      return _runInlineToolCall(
         name: response.name,
         args: Map<String, Object?>.from(response.args),
-        result: Map<String, Object?>.from(toolResult),
-      ));
-      // Buffer the tool response into the chat so the next user turn has
-      // full context, but skip the follow-up generate for terminal tools —
-      // their `acknowledgement` is already a complete, user-facing sentence
-      // and re-running the model to paraphrase it costs 10–15s on CPU.
-      await _chat!.addQueryChunk(
-        Message.toolResponse(toolName: response.name, response: toolResult),
+        originalUserText: originalUserText,
+        bufferToolResponse: true,
       );
-      final ack = toolResult['acknowledgement'] as String?;
-      final ok = toolResult['ok'] == true;
-      if (ok &&
-          ack != null &&
-          ack.isNotEmpty &&
-          _terminalAckTools.contains(response.name)) {
-        return ack;
-      }
-      final follow = await _chat!.generateChatResponse();
-      if (follow is TextResponse) return _stripThink(follow.token);
-      return ack ?? '';
     }
     return '';
+  }
+
+  /// Shared dispatch path for both the well-typed [FunctionCallResponse]
+  /// branch and the inline-markup workaround. Centralising it means a tool
+  /// that gets called via the leaky text path produces exactly the same
+  /// `lastToolCalls` entry, acknowledgement, and chat-session bookkeeping
+  /// as one that came through cleanly — the agent timeline can't tell the
+  /// difference.
+  Future<String> _runInlineToolCall({
+    required String name,
+    required Map<String, Object?> args,
+    required String originalUserText,
+    bool bufferToolResponse = false,
+  }) async {
+    // ignore: avoid_print
+    print('[GemmaService] tool dispatch: $name args=$args '
+        '(${bufferToolResponse ? "typed" : "inline-markup"})');
+    final toolResult = await _dispatchTool(
+      name: name,
+      args: args,
+      originalUserText: originalUserText,
+    );
+    lastToolCalls.add(AgentToolCall(
+      name: name,
+      args: args,
+      result: Map<String, Object?>.from(toolResult),
+    ));
+    // Buffer the tool response into the chat so the next user turn has full
+    // context. We only do this for the typed path because the inline-markup
+    // path already left the model's own tool-call tokens in the KV cache —
+    // adding a toolResponse on top can confuse some flutter_gemma builds.
+    if (bufferToolResponse) {
+      try {
+        await _chat!.addQueryChunk(
+          Message.toolResponse(toolName: name, response: toolResult),
+        );
+      } catch (e) {
+        // ignore: avoid_print
+        print('[GemmaService] tool-response buffer failed (non-fatal): $e');
+      }
+    }
+    final ack = toolResult['acknowledgement'] as String?;
+    final ok = toolResult['ok'] == true;
+    if (ok &&
+        ack != null &&
+        ack.isNotEmpty &&
+        _terminalAckTools.contains(name)) {
+      return ack;
+    }
+    // Non-terminal path: ask the model to paraphrase. Only safe when the
+    // session is in a state that accepts another generate. The inline path
+    // generally is not, so we just return the ack/error there.
+    if (!bufferToolResponse) return ack ?? '';
+    try {
+      final follow = await _chat!.generateChatResponse();
+      if (follow is TextResponse) return _stripThink(follow.token);
+    } catch (e) {
+      // ignore: avoid_print
+      print('[GemmaService] follow-up generate failed (non-fatal): $e');
+    }
+    return ack ?? '';
+  }
+
+  // ─── Inline tool-call markup parser ───────────────────────────────────────
+  //
+  // Gemma 4 emits function calls in a Gemma-specific grammar:
+  //   <|tool_call>call:TOOL_NAME{key:VALUE, key:VALUE, ...}
+  // String values are wrapped in Gemma's own quote token <|"|>...<|"|>.
+  // flutter_gemma 0.15.1 sometimes fails to parse this and returns the raw
+  // markup as a TextResponse. The helpers below extract that markup back
+  // into a normal tool dispatch.
+
+  static final RegExp _inlineToolCallPattern = RegExp(
+    r'<\|tool_call\|?>\s*call\s*:\s*([A-Za-z_][A-Za-z0-9_]*)\s*\{([^}]*)\}',
+    dotAll: true,
+  );
+
+  /// Gemma 4's own string-quote token. Note this is exactly five characters:
+  /// `<`, `|`, `"`, `|`, `>`.
+  static const String _gemma4QuoteToken = '<|"|>';
+
+  /// Return `null` when [raw] contains no recognisable tool-call markup,
+  /// otherwise return the parsed `(name, args)` pair.
+  static ({String name, Map<String, Object?> args})? _parseInlineToolCall(
+    String raw,
+  ) {
+    final m = _inlineToolCallPattern.firstMatch(raw);
+    if (m == null) return null;
+    final name = m.group(1)!;
+    final body = m.group(2) ?? '';
+    return (name: name, args: _parseGemma4ArgBody(body));
+  }
+
+  /// Parse the body of `{ ... }` into a map of arg-name → value. Tolerant of
+  /// whitespace, missing quotes around numbers/booleans, and the Gemma 4
+  /// `<|"|>` quote token (which is treated like a regular `"`). On malformed
+  /// input we return whatever could be parsed up to the failure point rather
+  /// than throwing — partial args are better than dropping the call entirely.
+  static Map<String, Object?> _parseGemma4ArgBody(String body) {
+    final out = <String, Object?>{};
+    final s = body;
+    var i = 0;
+    final n = s.length;
+    while (i < n) {
+      // Skip whitespace and separators.
+      while (i < n && (s[i] == ',' || _isWs(s[i]))) {
+        i++;
+      }
+      if (i >= n) break;
+      // Read key up to the next ':'.
+      final colon = s.indexOf(':', i);
+      if (colon < 0) break;
+      final key = s.substring(i, colon).trim();
+      i = colon + 1;
+      // Skip whitespace before value.
+      while (i < n && _isWs(s[i])) {
+        i++;
+      }
+      if (i >= n) {
+        if (key.isNotEmpty) out[key] = '';
+        break;
+      }
+      Object? value;
+      if (_startsWithAt(s, i, _gemma4QuoteToken)) {
+        // String value delimited by Gemma 4's quote token.
+        i += _gemma4QuoteToken.length;
+        final end = s.indexOf(_gemma4QuoteToken, i);
+        if (end < 0) {
+          value = s.substring(i);
+          i = n;
+        } else {
+          value = s.substring(i, end);
+          i = end + _gemma4QuoteToken.length;
+        }
+      } else if (i < n && (s[i] == '"' || s[i] == "'")) {
+        // Standard quoted string fallback.
+        final quote = s[i];
+        final end = s.indexOf(quote, i + 1);
+        if (end < 0) {
+          value = s.substring(i + 1);
+          i = n;
+        } else {
+          value = s.substring(i + 1, end);
+          i = end + 1;
+        }
+      } else {
+        // Bareword: number, boolean, or unquoted token. Read up to the next
+        // unescaped comma.
+        final comma = s.indexOf(',', i);
+        final endIdx = comma < 0 ? n : comma;
+        final tok = s.substring(i, endIdx).trim();
+        value = _coerceBareword(tok);
+        i = endIdx;
+      }
+      if (key.isNotEmpty) out[key] = value;
+    }
+    return out;
+  }
+
+  static bool _isWs(String ch) =>
+      ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r';
+
+  static bool _startsWithAt(String s, int i, String needle) {
+    if (i + needle.length > s.length) return false;
+    for (var j = 0; j < needle.length; j++) {
+      if (s[i + j] != needle[j]) return false;
+    }
+    return true;
+  }
+
+  static Object? _coerceBareword(String tok) {
+    if (tok.isEmpty) return tok;
+    final lower = tok.toLowerCase();
+    if (lower == 'true') return true;
+    if (lower == 'false') return false;
+    if (lower == 'null') return null;
+    final asInt = int.tryParse(tok);
+    if (asInt != null) return asInt;
+    final asDouble = double.tryParse(tok);
+    if (asDouble != null) return asDouble;
+    // Strip stray surrounding quotes if any survived.
+    if (tok.length >= 2) {
+      final first = tok[0];
+      final last = tok[tok.length - 1];
+      if ((first == '"' && last == '"') || (first == "'" && last == "'")) {
+        return tok.substring(1, tok.length - 1);
+      }
+    }
+    return tok;
   }
 
   Future<Map<String, Object?>> _dispatchTool({

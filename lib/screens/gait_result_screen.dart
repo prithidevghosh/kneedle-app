@@ -2,6 +2,7 @@ import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 import '../clinical/red_flags.dart';
 import '../core/theme.dart';
@@ -407,61 +408,14 @@ class _GaitResultScreenState extends ConsumerState<GaitResultScreen> {
               ),
             ],
 
-            // ── EXERCISES (existing) ────────────────────────────────────
+            // ── EXERCISES ───────────────────────────────────────────────
             if (response.exercises.isNotEmpty) ...[
               const SizedBox(height: KneedleTheme.space6),
               const KSectionTitle(eyebrow: 'Today', title: 'Exercises'),
               const SizedBox(height: KneedleTheme.space4),
               for (final ex in response.exercises) ...[
-                KCard(
-                  child: Row(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Container(
-                        width: 40,
-                        height: 40,
-                        decoration: BoxDecoration(
-                          color: KneedleTheme.amberTint,
-                          borderRadius:
-                              BorderRadius.circular(KneedleTheme.radiusSm),
-                        ),
-                        alignment: Alignment.center,
-                        child: const Icon(
-                          Icons.fitness_center_rounded,
-                          color: KneedleTheme.amber,
-                          size: 20,
-                        ),
-                      ),
-                      const SizedBox(width: KneedleTheme.space3),
-                      Expanded(
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Text(ex.def.name,
-                                style:
-                                    Theme.of(context).textTheme.titleMedium),
-                            if (ex.def.repsEn.isNotEmpty) ...[
-                              const SizedBox(height: 2),
-                              Text(ex.def.repsEn,
-                                  style: Theme.of(context)
-                                      .textTheme
-                                      .bodySmall),
-                            ],
-                            if (ex.reason.isNotEmpty) ...[
-                              const SizedBox(height: KneedleTheme.space2),
-                              Text(ex.reason,
-                                  style: const TextStyle(
-                                      fontSize: 14,
-                                      height: 1.4,
-                                      color: KneedleTheme.ink)),
-                            ],
-                          ],
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-                const SizedBox(height: KneedleTheme.space2),
+                _ExerciseCard(prescribed: ex),
+                const SizedBox(height: KneedleTheme.space3),
               ],
             ],
 
@@ -1419,6 +1373,271 @@ class _GenStatsBar extends StatelessWidget {
             ),
           ),
         ],
+      ),
+    );
+  }
+}
+
+/// Single exercise row in the report. English name + reps + reason + a
+/// tap-to-open YouTube demo (when [ExerciseDef.videoUrl] resolves to a
+/// valid video id).
+///
+/// We render the YouTube thumbnail and launch the link externally
+/// (YouTube app first, browser fallback) instead of embedding the IFrame
+/// player. Reason: many physio-channel videos disable third-party embeds
+/// — the IFrame would show "error 152" for ~half of the library, which
+/// looks broken on demo day. The external-launch pattern works for 100 %
+/// of valid links.
+class _ExerciseCard extends StatelessWidget {
+  const _ExerciseCard({required this.prescribed});
+  final PrescribedExercise prescribed;
+
+  /// Pull the 11-char YouTube id out of any of the common URL shapes:
+  ///   https://www.youtube.com/watch?v=XXXXXXXXXXX
+  ///   https://youtu.be/XXXXXXXXXXX
+  ///   https://www.youtube.com/embed/XXXXXXXXXXX
+  ///   https://www.youtube.com/shorts/XXXXXXXXXXX
+  /// Returns null if the input doesn't look like a YouTube URL.
+  static String? _extractYoutubeId(String url) {
+    if (url.isEmpty) return null;
+    final reg = RegExp(
+      r'(?:youtube\.com/(?:watch\?v=|embed/|shorts/)|youtu\.be/)([A-Za-z0-9_-]{11})',
+    );
+    return reg.firstMatch(url)?.group(1);
+  }
+
+  Future<void> _openVideo(BuildContext context, String url) async {
+    final uri = Uri.tryParse(url);
+    if (uri == null) return;
+    // Prefer the YouTube app via the platform's default deep-link handler;
+    // url_launcher falls back to a browser when no app handles the URL.
+    final ok = await launchUrl(uri, mode: LaunchMode.externalApplication);
+    if (!ok && context.mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text("Couldn't open the video.")),
+      );
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final def = prescribed.def;
+    final reason = prescribed.reason;
+    final id = _extractYoutubeId(def.videoUrl);
+
+    return KCard(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Container(
+                width: 40,
+                height: 40,
+                decoration: BoxDecoration(
+                  color: KneedleTheme.amberTint,
+                  borderRadius:
+                      BorderRadius.circular(KneedleTheme.radiusSm),
+                ),
+                alignment: Alignment.center,
+                child: const Icon(
+                  Icons.fitness_center_rounded,
+                  color: KneedleTheme.amber,
+                  size: 20,
+                ),
+              ),
+              const SizedBox(width: KneedleTheme.space3),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(def.nameEn,
+                        style: Theme.of(context).textTheme.titleMedium),
+                    if (def.repsEn.isNotEmpty) ...[
+                      const SizedBox(height: 2),
+                      Text(def.repsEn,
+                          style: Theme.of(context).textTheme.bodySmall),
+                    ],
+                  ],
+                ),
+              ),
+            ],
+          ),
+          if (def.descriptionEn.isNotEmpty) ...[
+            const SizedBox(height: KneedleTheme.space3),
+            Text(
+              def.descriptionEn,
+              style: const TextStyle(
+                fontSize: 14,
+                height: 1.5,
+                color: KneedleTheme.ink,
+              ),
+            ),
+          ],
+          if (reason.isNotEmpty) ...[
+            const SizedBox(height: KneedleTheme.space3),
+            Container(
+              padding: const EdgeInsets.symmetric(
+                horizontal: 10,
+                vertical: 8,
+              ),
+              decoration: BoxDecoration(
+                color: KneedleTheme.sageSoft,
+                borderRadius:
+                    BorderRadius.circular(KneedleTheme.radiusSm),
+              ),
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Icon(
+                    Icons.lightbulb_outline_rounded,
+                    size: 16,
+                    color: KneedleTheme.sageDeep,
+                  ),
+                  const SizedBox(width: 6),
+                  Expanded(
+                    child: Text(
+                      reason,
+                      style: const TextStyle(
+                        fontSize: 13,
+                        height: 1.4,
+                        color: KneedleTheme.sageDeep,
+                        fontWeight: FontWeight.w500,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+          if (id != null) ...[
+            const SizedBox(height: KneedleTheme.space3),
+            _YoutubeThumb(
+              videoId: id,
+              onTap: () => _openVideo(context, def.videoUrl),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+/// 16:9 YouTube thumbnail with a centred play badge and a small "Watch on
+/// YouTube" tag at the bottom. Tap → launch the video externally.
+///
+/// We try the high-quality thumbnail first (`hqdefault.jpg`) and fall back
+/// to the always-present `0.jpg` if YouTube serves a 404 (some shorts only
+/// have the lower-res variant). On total network failure we render a tonal
+/// placeholder so the card still tells the user a video exists.
+class _YoutubeThumb extends StatelessWidget {
+  const _YoutubeThumb({required this.videoId, required this.onTap});
+  final String videoId;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final primary = 'https://img.youtube.com/vi/$videoId/hqdefault.jpg';
+    final fallback = 'https://img.youtube.com/vi/$videoId/0.jpg';
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(KneedleTheme.radiusSm),
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(KneedleTheme.radiusSm),
+        child: AspectRatio(
+          aspectRatio: 16 / 9,
+          child: Stack(
+            fit: StackFit.expand,
+            children: [
+              Image.network(
+                primary,
+                fit: BoxFit.cover,
+                errorBuilder: (_, __, ___) => Image.network(
+                  fallback,
+                  fit: BoxFit.cover,
+                  errorBuilder: (_, __, ___) => Container(
+                    color: KneedleTheme.sageTint,
+                    alignment: Alignment.center,
+                    child: const Icon(
+                      Icons.play_circle_outline_rounded,
+                      size: 56,
+                      color: KneedleTheme.sageDeep,
+                    ),
+                  ),
+                ),
+              ),
+              // Subtle bottom-to-top dim so the play badge and label read
+              // clearly on bright thumbnails.
+              const DecoratedBox(
+                decoration: BoxDecoration(
+                  gradient: LinearGradient(
+                    begin: Alignment.topCenter,
+                    end: Alignment.bottomCenter,
+                    colors: [Color(0x00000000), Color(0x55000000)],
+                  ),
+                ),
+              ),
+              Center(
+                child: Container(
+                  width: 56,
+                  height: 56,
+                  decoration: BoxDecoration(
+                    color: Colors.white.withValues(alpha: 0.92),
+                    shape: BoxShape.circle,
+                    boxShadow: const [
+                      BoxShadow(
+                        color: Color(0x33000000),
+                        blurRadius: 12,
+                        offset: Offset(0, 4),
+                      ),
+                    ],
+                  ),
+                  alignment: Alignment.center,
+                  child: const Icon(
+                    Icons.play_arrow_rounded,
+                    color: Color(0xFFE53935),
+                    size: 36,
+                  ),
+                ),
+              ),
+              Positioned(
+                left: 10,
+                bottom: 10,
+                child: Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 8,
+                    vertical: 4,
+                  ),
+                  decoration: BoxDecoration(
+                    color: Colors.black.withValues(alpha: 0.55),
+                    borderRadius: BorderRadius.circular(99),
+                  ),
+                  child: const Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(
+                        Icons.smart_display_rounded,
+                        size: 14,
+                        color: Colors.white,
+                      ),
+                      SizedBox(width: 4),
+                      Text(
+                        'Watch on YouTube',
+                        style: TextStyle(
+                          fontSize: 11,
+                          fontWeight: FontWeight.w700,
+                          color: Colors.white,
+                          letterSpacing: 0.2,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
       ),
     );
   }

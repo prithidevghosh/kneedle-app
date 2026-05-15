@@ -15,7 +15,7 @@ dependencies:
   flutter_riverpod: ^2.5.1
 
   # On-device LLM — Gemma 4 E2B via LiteRT
-  flutter_gemma: ^0.15.0
+  flutter_gemma: ^0.15.1
 
   # Pose & camera
   # google_mlkit_pose_detection works on iOS+Android with the same 33-landmark
@@ -55,6 +55,13 @@ dependencies:
   # can ingest them.
   image: ^4.3.0
 
+  # Open YouTube exercise demos externally (in the YouTube app when installed,
+  # else the system browser). We deliberately avoid embedded IFrame playback
+  # because too many physio-channel videos disable third-party embeds
+  # (YouTube error 152), which would otherwise show a broken player in the
+  # report. The thumbnail-plus-tap pattern works for 100 % of valid links.
+  url_launcher: ^6.3.0
+
 dev_dependencies:
   flutter_test:
     sdk: flutter
@@ -64,3 +71,4 @@ flutter:
   uses-material-design: true
   assets:
     - assets/prompts/
+    - assets/kb/
