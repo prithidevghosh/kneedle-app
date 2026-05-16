@@ -57,6 +57,8 @@ class GemmaService {
   static const _modelUrl =
       'https://huggingface.co/litert-community/gemma-4-E2B-it-litert-lm/resolve/7fa1d78473894f7e736a21d920c3aa80f950c0db/gemma-4-E2B-it.litertlm';
 
+  static const _modelUrlE4b = 
+    'https://huggingface.co/litert-community/gemma-4-E4B-it-litert-lm/resolve/main/gemma-4-E4B-it.litertlm';
   // Vision is enabled for gait analysis: we attach 4 JPEGs (2 frontal + 2
   // sagittal walk frames) alongside the MediaPipe measurements so Gemma can
   // visually cross-check what the numbers describe. The companion chat path
@@ -68,12 +70,108 @@ class GemmaService {
   String? _systemPrompt;
   bool _initialising = false;
 
+  /// Single global gate around the on-device inference engine. LiteRT-LM can
+  /// only run ONE `generateChatResponse` / `generateChatResponseAsync` at a
+  /// time across the entire process — multiple `InferenceChat` objects all
+  /// share the same native executor. Without this gate, if one path's
+  /// generation is abandoned (e.g. a screen disposed mid-warmup), the engine
+  /// is left in a queued state and every other caller's generate-* call
+  /// hangs silently forever — exactly the "Hey Kneedle silent hang" bug.
+  ///
+  /// Every entry point that triggers generation chains through
+  /// [runOnEngine], which: (a) waits for the previous run to finish, (b)
+  /// runs the new body with a timeout so a stuck native call surfaces fast,
+  /// (c) releases the gate in `finally` so an exception in one run never
+  /// permanently locks the engine for everyone else.
+  ///
+  /// Static because the engine is a process-wide singleton — every
+  /// `InferenceChat` (companion `_chat`, gait analysis session, gait chat
+  /// session) competes for the same underlying executor.
+  static Future<void> _engineGate = Future<void>.value();
+
+  static Future<T> runOnEngine<T>(
+    Future<T> Function() body, {
+    Duration timeout = const Duration(seconds: 90),
+    String label = 'engine',
+  }) {
+    final prev = _engineGate;
+    final completer = Completer<void>();
+    _engineGate = completer.future;
+    return Future<T>.sync(() async {
+      try {
+        await prev;
+      } catch (_) {/* previous run's error must not poison the queue */}
+      try {
+        return await body().timeout(timeout, onTimeout: () {
+          // ignore: avoid_print
+          print('[GemmaService] runOnEngine[$label] TIMEOUT after '
+              '${timeout.inSeconds}s — releasing gate so other callers can proceed');
+          throw TimeoutException(
+              'Inference engine timed out after ${timeout.inSeconds}s', timeout);
+        });
+      } finally {
+        if (!completer.isCompleted) completer.complete();
+      }
+    });
+  }
+
   /// Stats from the most recent companion-chat or voice-chat call. Surfaced
   /// in the home / voice screens via the tokens-per-second pill so the user
   /// can see how fast Gemma is decoding.
   LlmStats? lastStats;
 
   bool get isReady => _model != null && _chat != null;
+
+  /// (Re)build the companion `_chat` from scratch: createChat → seed system
+  /// prompt → (optional) one-token warmup. Used by both `initialise()` and
+  /// the self-healing path that recovers when another code path
+  /// (`analyseGait`, `openGaitChat`) destroyed the shared native session.
+  ///
+  /// Why this is needed: flutter_gemma 0.15 keeps `InferenceModel.chat` and
+  /// the underlying native conversation as single-slot fields. Calling
+  /// `_model.createChat(...)` anywhere in the app REPLACES the native
+  /// conversation, leaving every existing `InferenceChat` Dart object with
+  /// a dead session. `addQueryChunk` (Dart-only) still succeeds, but
+  /// `generateChatResponse` throws "Bad state: session is closed". Rebuild
+  /// here puts the companion back on a fresh native conversation.
+  Future<void> _buildCompanionChat({required bool warmup}) async {
+    _chat = await _model!.createChat(
+      temperature: 0.6,
+      topK: 40,
+      topP: 0.95,
+      tokenBuffer: 256,
+      supportsFunctionCalls: true,
+      tools: _toolDefinitions,
+    );
+    await _chat!.addQueryChunk(
+      Message.text(text: _systemPrompt!, isUser: true),
+    );
+    if (!warmup) return;
+    // ignore: avoid_print
+    print('[GemmaService] warming companion chat (prefilling system prompt)');
+    final warmSw = Stopwatch()..start();
+    try {
+      final warm = await _chat!.generateChatResponse();
+      final preview = warm is TextResponse ? warm.token : '';
+      // ignore: avoid_print
+      print('[GemmaService] warmup done in ${warmSw.elapsedMilliseconds}ms '
+          '(model said: "${preview.trim()}")');
+    } catch (e) {
+      // ignore: avoid_print
+      print('[GemmaService] warmup failed (non-fatal): $e');
+    }
+  }
+
+  /// True if `e` looks like the "session was replaced by another createChat"
+  /// failure shape from flutter_gemma. Used to drive self-healing rebuild +
+  /// retry in companion-chat call sites.
+  static bool _isSessionClosedError(Object e) {
+    if (e is! StateError) return false;
+    final m = e.message.toLowerCase();
+    return m.contains('session is closed') ||
+        m.contains('session closed') ||
+        m.contains('model is closed');
+  }
 
   Future<void> initialise({
     void Function(double progress)? onDownloadProgress,
@@ -114,38 +212,7 @@ class GemmaService {
 
       // ignore: avoid_print
       print('[GemmaService] init step 4/4: creating chat session');
-      _chat = await _model!.createChat(
-        temperature: 0.6,
-        topK: 40,
-        topP: 0.95,
-        tokenBuffer: 256,
-        supportsFunctionCalls: true,
-        tools: _toolDefinitions,
-      );
-
-      await _chat!.addQueryChunk(
-        Message.text(text: _systemPrompt!, isUser: true),
-      );
-
-      // Warm the session: force the model to prefill the system prompt now,
-      // during the loading screen, instead of paying ~20s on the user's first
-      // real message. The system prompt asks the model to acknowledge with a
-      // single token ("Ready."), so the discarded decode is ~1 chunk. After
-      // this returns, subsequent turns prefill incrementally over the cached
-      // system-prompt KV.
-      // ignore: avoid_print
-      print('[GemmaService] init step 4/4: warming session (prefilling system prompt)');
-      final warmSw = Stopwatch()..start();
-      try {
-        final warm = await _chat!.generateChatResponse();
-        final preview = warm is TextResponse ? warm.token : '';
-        // ignore: avoid_print
-        print('[GemmaService] warmup done in ${warmSw.elapsedMilliseconds}ms '
-            '(model said: "${preview.trim()}")');
-      } catch (e) {
-        // ignore: avoid_print
-        print('[GemmaService] warmup failed (non-fatal): $e');
-      }
+      await _buildCompanionChat(warmup: true);
       // ignore: avoid_print
       print('[GemmaService] init complete — model ready');
     } catch (e, st) {
@@ -203,10 +270,33 @@ class GemmaService {
     // ignore: avoid_print
     print('[GemmaService] chat INPUT (${userText.length} chars): $userText');
     final sw = Stopwatch()..start();
-    await _chat!.addQueryChunk(Message.text(text: userText, isUser: true));
-    final response = await _chat!.generateChatResponse();
-    final reply = await _handleResponse(response, originalUserText: userText);
-    sw.stop();
+    // Serialize through the engine gate so a stuck/orphaned generation from
+    // another path (gait chat warmup, analysis) can't silently lock this one.
+    //
+    // Self-heal: if the companion's session was destroyed by another path
+    // calling `_model.createChat(...)` (gait analysis, gait Q&A), the first
+    // call here throws StateError. We rebuild the companion chat and retry
+    // exactly once before surfacing.
+    Future<String> runOnce({required bool isRetry}) {
+      final label = isRetry ? 'companion.chat.retry' : 'companion.chat';
+      return runOnEngine<String>(() async {
+        await _chat!.addQueryChunk(Message.text(text: userText, isUser: true));
+        final response = await _chat!.generateChatResponse();
+        return _handleResponse(response, originalUserText: userText);
+      }, label: label);
+    }
+
+    String reply;
+    try {
+      reply = await runOnce(isRetry: false);
+    } on StateError catch (e) {
+      if (!_isSessionClosedError(e)) rethrow;
+      // ignore: avoid_print
+      print('[GemmaService] chat: companion session was replaced — '
+          'rebuilding and retrying once');
+      await _buildCompanionChat(warmup: false);
+      reply = await runOnce(isRetry: true);
+    }
     final stats = LlmStats(
       inputChars: userText.length,
       outputChars: reply.length,
@@ -224,15 +314,32 @@ class GemmaService {
 
   Future<String> extractPainEntry(String voiceTranscript) async {
     _ensure();
-    const instruction = 'The user just spoke about their pain. Call '
-        'record_pain_entry with the extracted fields, then briefly '
-        'acknowledge in one sentence.';
-    await _chat!.addQueryChunk(Message.text(
-      text: '$instruction\n\nUser said: "$voiceTranscript"',
-      isUser: true,
-    ));
-    final response = await _chat!.generateChatResponse();
-    return _handleResponse(response, originalUserText: voiceTranscript);
+    const instruction = 'The patient just spoke about their pain. '
+        'STEP 1: call record_pain_entry exactly once with the extracted '
+        'pain_score (0-10) and body location. '
+        'STEP 2: when you see the tool result, respond with PLAIN TEXT only '
+        '— one or two warm sentences in a kind-nurse tone, referencing what '
+        'they actually said (e.g. the stairs, the walk, the night, the '
+        'weather). Do NOT call any more tools after step 1. Do NOT output '
+        'JSON or function calls in step 2. Speak directly to the patient.';
+    Future<String> runOnce() => runOnEngine<String>(() async {
+          await _chat!.addQueryChunk(Message.text(
+            text: '$instruction\n\nUser said: "$voiceTranscript"',
+            isUser: true,
+          ));
+          final response = await _chat!.generateChatResponse();
+          return _handleResponse(response, originalUserText: voiceTranscript);
+        }, label: 'companion.extractPainEntry');
+    try {
+      return await runOnce();
+    } on StateError catch (e) {
+      if (!_isSessionClosedError(e)) rethrow;
+      // ignore: avoid_print
+      print('[GemmaService] extractPainEntry: companion session replaced — '
+          'rebuilding and retrying once');
+      await _buildCompanionChat(warmup: false);
+      return runOnce();
+    }
   }
 
   Future<String> generateWeeklySummary(List<PainEntry> entries) async {
@@ -241,17 +348,29 @@ class GemmaService {
       return 'No pain entries this week. Keep up the gentle movement.';
     }
     final json = jsonEncode([for (final e in entries) e.toJson()]);
-    await _chat!.addQueryChunk(Message.text(
-      text:
-          'Summarise this past week of pain entries in 2 short paragraphs. '
-          'Tone: warm, non-medical, factual. Highlight any worsening or '
-          'improving trend, dominant location, and one practical suggestion.\n\n'
-          'Entries (JSON): $json',
-      isUser: true,
-    ));
-    final response = await _chat!.generateChatResponse();
-    if (response is TextResponse) return response.token;
-    return 'Summary unavailable.';
+    Future<String> runOnce() => runOnEngine<String>(() async {
+          await _chat!.addQueryChunk(Message.text(
+            text:
+                'Summarise this past week of pain entries in 2 short paragraphs. '
+                'Tone: warm, non-medical, factual. Highlight any worsening or '
+                'improving trend, dominant location, and one practical suggestion.\n\n'
+                'Entries (JSON): $json',
+            isUser: true,
+          ));
+          final response = await _chat!.generateChatResponse();
+          if (response is TextResponse) return response.token;
+          return 'Summary unavailable.';
+        }, label: 'companion.generateWeeklySummary');
+    try {
+      return await runOnce();
+    } on StateError catch (e) {
+      if (!_isSessionClosedError(e)) rethrow;
+      // ignore: avoid_print
+      print('[GemmaService] generateWeeklySummary: companion session replaced '
+          '— rebuilding and retrying once');
+      await _buildCompanionChat(warmup: false);
+      return runOnce();
+    }
   }
 
   // ─── Gait analysis — port of gemma_client.call_gemma4 ────────────────────
@@ -757,9 +876,23 @@ class GemmaService {
     Tool(
       name: 'start_gait_test',
       description:
-          'Launch the on-device walking analysis. Use when the user wants '
-          'to "do a gait check", "run a walk test", "check how I walk", or '
-          'similar. Takes no arguments.',
+          'Launch the on-device walking / gait analysis. Use whenever the '
+          'user asks to "do a gait check", "run a walk test", "check how I '
+          'walk", "start the analysis", "start gait analysis", "do the '
+          'walking test", or any similar request that means "begin the gait '
+          'capture flow". Always prefer calling this tool over describing '
+          'the steps in text. Takes no arguments.',
+      parameters: {'type': 'object', 'properties': {}},
+    ),
+    Tool(
+      name: 'start_exercise',
+      description:
+          'Open the exercise coach screen so the user can begin their '
+          'prescribed knee exercises. Use whenever they say "start '
+          'exercise(s)", "begin my exercises", "open the exercise coach", '
+          '"let\'s do my reps", "I want to exercise", or similar. Always '
+          'prefer calling this tool over describing the exercises in text. '
+          'Takes no arguments.',
       parameters: {'type': 'object', 'properties': {}},
     ),
     Tool(
@@ -798,6 +931,7 @@ class GemmaService {
     'remove_medication',
     'remove_appointment',
     'start_gait_test',
+    'start_exercise',
     'show_history',
     'generate_doctor_report',
   };
@@ -805,8 +939,8 @@ class GemmaService {
   /// One entry per tool call made during the most recent `chat()` /
   /// `extractPainEntry()` round-trip. Cleared at the start of each call.
   /// Read by `AgentScreen` to render the tool-execution timeline and to
-  /// dispatch any navigation intents (start_gait_test, show_history,
-  /// generate_doctor_report) after the modal closes.
+  /// dispatch any navigation intents (start_gait_test, start_exercise,
+  /// show_history, generate_doctor_report) after the modal closes.
   final List<AgentToolCall> lastToolCalls = [];
 
   Future<String> _handleResponse(
@@ -1052,8 +1186,11 @@ class GemmaService {
         await StorageService.savePainEntry(entry);
         return {
           'ok': true,
-          'acknowledgement':
-              'Logged: $score/10 at $location. Take it easy today.',
+          'acknowledgement': _composePainAck(
+            score: score.clamp(0, 10),
+            location: location,
+            transcript: originalUserText,
+          ),
         };
 
       case 'schedule_reminder':
@@ -1275,6 +1412,15 @@ class GemmaService {
               'and tap start when you\'re ready.',
         };
 
+      case 'start_exercise':
+        return {
+          'ok': true,
+          'nav': 'exercise',
+          'acknowledgement':
+              'Opening the exercise coach — pick a movement and I\'ll pace '
+              'the reps for you.',
+        };
+
       case 'show_history':
         final weeks = ((args['weeks'] as num?)?.toInt() ?? 4).clamp(1, 12);
         return {
@@ -1347,6 +1493,16 @@ class GemmaService {
     //    We drop any `"..."` token that sits between a `,` and a `,`/`"key":`.
     body = body.replaceAll(RegExp(r',\s*"[^"\n]*"\s*,'), ',');
     body = body.replaceAll(RegExp(r',\s*,'), ',');
+    // 4a. On-device Gemma sometimes leaves a dangling unterminated `"` after
+    //     the last entry of an array or object, e.g. `"glute_bridge",    "\n  ]`.
+    //     That unterminated quote swallows the closer and crashes jsonDecode
+    //     with "Control character in string". Require comma + whitespace +
+    //     bare `"` + whitespace + closer so we don't strip the legitimate
+    //     close-quote of the last item in a well-formed array.
+    body = body.replaceAllMapped(
+      RegExp(r',\s+"\s*([\]\}])'),
+      (m) => m[1]!,
+    );
     body = body.replaceAllMapped(RegExp(r',\s*([}\]])'), (m) => m[1]!);
 
     // 5. If the model was truncated, jsonDecode will throw. Walk the string
@@ -1401,6 +1557,66 @@ class GemmaService {
     }
   }
 
+  /// Lowercase + strip every non-alnum so `_clamshell`, `Clamshell`,
+  /// `step-up`, and `step_up` all collide onto the same key for matching
+  /// against the library.
+  static String _normalizeExerciseId(String s) =>
+      s.toLowerCase().replaceAll(RegExp(r'[^a-z0-9]'), '');
+
+  /// Strip leaks of the field-spec into the model output: stray leading
+  /// dashes/asterisks, leading "for" left over from the spec example
+  /// (`"for ex2"`), and trailing whitespace.
+  static String _cleanReason(String s) {
+    var out = s.trim();
+    out = out.replaceFirst(RegExp(r'^[\-\*•–—]\s*'), '');
+    out = out.replaceFirst(RegExp(r'^for\s+', caseSensitive: false), '');
+    return out.trim();
+  }
+
+  /// Find a value in `data` by the canonical key, falling back to any key
+  /// whose normalized form matches. Catches Gemma quirks like emitting
+  /// `_joint` instead of `active_joint`.
+  static String? _fuzzyStringField(Map<String, Object?> data, String key) {
+    final direct = data[key];
+    if (direct is String && direct.isNotEmpty) return direct;
+    final target = _normalizeExerciseId(key);
+    for (final entry in data.entries) {
+      if (_normalizeExerciseId(entry.key) == target) {
+        final v = entry.value;
+        if (v is String && v.isNotEmpty) return v;
+      }
+    }
+    // Also tolerate truncated-prefix variants ("_joint" for "active_joint"):
+    // accept any key whose normalized form is a suffix of the target.
+    for (final entry in data.entries) {
+      final n = _normalizeExerciseId(entry.key);
+      if (n.isNotEmpty && target.endsWith(n) && n != target) {
+        final v = entry.value;
+        if (v is String && v.isNotEmpty) return v;
+      }
+    }
+    return null;
+  }
+
+  /// True if `text` looks like a hallucinated tool/function-call envelope
+  /// rather than a normal spoken reply. Covers the two shapes Gemma has been
+  /// observed to emit on-device: an OpenAI-style JSON object whose top-level
+  /// keys include `tool_calls` / `function` / `role`+`content`, and the
+  /// Gemma-native `<|tool_call|>` marker. Trimmed before matching so stray
+  /// leading whitespace doesn't break detection.
+  static bool _looksLikeToolCallEnvelope(String text) {
+    final t = text.trim();
+    if (t.isEmpty) return false;
+    if (t.contains('<|tool_call')) return true;
+    if (t.startsWith('{') &&
+        (t.contains('"tool_calls"') ||
+            t.contains('"function"') ||
+            (t.contains('"role"') && t.contains('"assistant"')))) {
+      return true;
+    }
+    return false;
+  }
+
   static String _stripThink(String raw) {
     final s = raw.trimLeft();
     if (s.startsWith('<think>') && s.contains('</think>')) {
@@ -1417,6 +1633,89 @@ class GemmaService {
 
   String _formatWhen(DateTime t) =>
       '${t.hour.toString().padLeft(2, '0')}:${t.minute.toString().padLeft(2, '0')}';
+
+  /// Deterministic, context-aware acknowledgement for `record_pain_entry`.
+  /// This is what the patient ACTUALLY sees and hears: the model's free-form
+  /// follow-up is unreliable (sometimes another tool call, sometimes nothing),
+  /// so we make sure the canonical tool reply is itself empathetic and
+  /// references what the patient just said.
+  ///
+  /// Three signals shape the reply:
+  /// 1. pain band (low / moderate / high) → tone
+  /// 2. body location (knee / hip / etc.) → which part to name
+  /// 3. cue word in the transcript (stairs, walk, sleep, sit, weather, etc.)
+  ///    → a "I noticed you mentioned X" line that makes the reply specific
+  String _composePainAck({
+    required int score,
+    required String location,
+    required String transcript,
+  }) {
+    final loc = location == 'unspecified' || location.isEmpty
+        ? 'your knee'
+        : (location.toLowerCase().startsWith('your ')
+            ? location.toLowerCase()
+            : 'your ${location.toLowerCase()}');
+    final t = transcript.toLowerCase();
+
+    // Pick at most one cue — the first that fits — to avoid a wall of
+    // empathy. Order is rough most-specific → most-generic.
+    String? cue;
+    if (RegExp(r'\bstair(s|case)?\b|\bclimb').hasMatch(t)) {
+      cue = 'the stairs took a toll today';
+    } else if (RegExp(r'\bwalk(ing|ed)?\b|\bwalk\b').hasMatch(t)) {
+      cue = 'the walking added up';
+    } else if (RegExp(r'\bstand(ing)?\b').hasMatch(t)) {
+      cue = 'being on your feet for a while caught up with you';
+    } else if (RegExp(r'\bsit(ting)?\b').hasMatch(t)) {
+      cue = 'sitting for long can stiffen the joint';
+    } else if (RegExp(r'\bsleep|\bnight|\bwoke|\bwake').hasMatch(t)) {
+      cue = 'pain that lingers into the night is tiring';
+    } else if (RegExp(r'\bcold|\bweather|\brain|\bmonsoon').hasMatch(t)) {
+      cue = 'cool weather often stiffens an OA knee';
+    } else if (RegExp(r'\bworse|\bmore than|\bworst|\bunbear').hasMatch(t)) {
+      cue = 'this sounds worse than usual';
+    } else if (RegExp(r'\bbetter|\beasier|\bimproved|\bless\b').hasMatch(t)) {
+      cue = 'good to hear it feels a bit easier';
+    }
+
+    final scoreWord = _painScoreWord(score);
+    final band = score <= 3
+        ? 'low'
+        : score <= 6
+            ? 'moderate'
+            : 'high';
+
+    // Tone scales with pain band — gentle praise on low, gentle reassurance
+    // on moderate, gentle slow-down on high.
+    String guidance;
+    switch (band) {
+      case 'low':
+        guidance = 'Keep up the gentle movement — that\'s how good days '
+            'stack up.';
+        break;
+      case 'moderate':
+        guidance = 'Take it at your own pace today, and try a warm towel '
+            'on $loc if it helps.';
+        break;
+      default: // 'high'
+        guidance = 'Please rest $loc today. Skip stairs if you can, and '
+            'try a warm towel for ten minutes — it often takes the edge off.';
+    }
+
+    final cueLine = cue == null ? '' : ' $cue.';
+    return 'Logged $scoreWord in $loc.$cueLine $guidance';
+  }
+
+  static String _painScoreWord(int score) {
+    // Spell numbers out for TTS — "five out of ten" reads more naturally
+    // than "5/10" and avoids the awkward "five slash ten" some engines do.
+    const words = [
+      'zero', 'one', 'two', 'three', 'four', 'five',
+      'six', 'seven', 'eight', 'nine', 'ten',
+    ];
+    final n = score.clamp(0, 10);
+    return '${words[n]} out of ten';
+  }
 
   static const _months = [
     'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
@@ -1444,8 +1743,14 @@ class GemmaService {
     final data = _looseParseJson(raw);
 
     // Restrict the model's selection to the severity-filtered library so it
-    // can't smuggle a contraindicated exercise back in.
+    // can't smuggle a contraindicated exercise back in. The on-device Gemma
+    // sometimes mangles ids — adds a leading underscore (`_clamshell`),
+    // capitalizes (`Clamshell`), or hyphenates (`step-up`). Normalize before
+    // matching so a fixable typo doesn't silently fall through to the top-up.
     final allowedIds = {for (final e in library) e.id};
+    final normalizedAllowed = {
+      for (final id in allowedIds) _normalizeExerciseId(id): id,
+    };
     final picked =
         ((data['selected_exercise_ids'] as List?) ?? const []).cast<Object?>();
     final reasons =
@@ -1454,11 +1759,20 @@ class GemmaService {
     final exercises = <PrescribedExercise>[];
     final chosenIds = <String>{};
     for (var i = 0; i < picked.length && exercises.length < 4; i++) {
-      final id = picked[i]?.toString();
-      if (id == null || !allowedIds.contains(id)) continue;
+      final raw = picked[i]?.toString();
+      if (raw == null) continue;
+      var id = raw;
+      if (!allowedIds.contains(id)) {
+        final resolved = normalizedAllowed[_normalizeExerciseId(raw)];
+        if (resolved == null) continue;
+        id = resolved;
+      }
+      if (chosenIds.contains(id)) continue;
       final def = getExerciseById(id);
       if (def == null) continue;
-      final reason = i < reasons.length ? (reasons[i]?.toString() ?? '') : '';
+      final reason = i < reasons.length
+          ? _cleanReason(reasons[i]?.toString() ?? '')
+          : '';
       exercises.add(PrescribedExercise(def: def, reason: reason));
       chosenIds.add(id);
     }
@@ -1485,11 +1799,16 @@ class GemmaService {
       }
     }
 
+    // Fuzzy-tolerant lookup: on-device Gemma sometimes truncates the prefix
+    // off keys (`_meaning` for `symmetry_meaning`, `title` for `fix_title`).
+    // Resolve via _fuzzyStringField first so we don't silently fall through
+    // to safety-default text.
     String localized(String key, String fallback) {
-      final v = data[key];
-      if (v is String && v.trim().isNotEmpty) return v;
+      final v = _fuzzyStringField(data, key);
+      if (v != null && v.trim().isNotEmpty) return v;
       return fallback;
     }
+    String? fuzzy(String key) => _fuzzyStringField(data, key);
 
     final symDefault = switch (symBand) {
       'good' => safety.symGood,
@@ -1509,15 +1828,15 @@ class GemmaService {
     final referralTextEn = referralRecommended ? safetyEn.referralSevere : '';
 
     return AnalysisResponse(
-      observation: (data['observation'] as String?) ?? '',
-      observationEn: (data['observation_en'] as String?) ?? '',
-      fixTitle: (data['fix_title'] as String?) ?? '',
-      fixDesc: (data['fix_desc'] as String?) ?? '',
-      fixTitleEn: (data['fix_title_en'] as String?) ?? '',
-      fixDescEn: (data['fix_desc_en'] as String?) ?? '',
+      observation: fuzzy('observation') ?? '',
+      observationEn: fuzzy('observation_en') ?? '',
+      fixTitle: fuzzy('fix_title') ?? '',
+      fixDesc: fuzzy('fix_desc') ?? '',
+      fixTitleEn: fuzzy('fix_title_en') ?? '',
+      fixDescEn: fuzzy('fix_desc_en') ?? '',
       exercises: exercises,
       activeJoint:
-          (data['active_joint'] as String?) ?? getActiveJoint(metrics),
+          _fuzzyStringField(data, 'active_joint') ?? getActiveJoint(metrics),
       symmetryScore: metrics.symmetryScore ?? 0,
       sessionNumber: sessionNumber,
       thinking: data['thinking_summary'] as String?,
@@ -1698,7 +2017,8 @@ class AgentToolCall {
   ///   * `ok` (bool) — true on success.
   ///   * `acknowledgement` (String?) — user-facing one-line summary.
   ///   * `nav` (String?) — set by navigation-intent tools
-  ///     (`start_gait_test` → 'gait_capture', `show_history` → 'history',
+  ///     (`start_gait_test` → 'gait_capture', `start_exercise` →
+  ///     'exercise', `show_history` → 'history',
   ///     `generate_doctor_report` → 'doctor_report').
   final Map<String, Object?> result;
 
@@ -1761,42 +2081,63 @@ class GaitChatSession {
     print('[GaitChatSession] ask INPUT (${userText.length} chars, '
         'evidence=${retrieval.hits.length}): $userText');
 
-    final prefillSw = Stopwatch()..start();
-    await _chat.addQueryChunk(Message.text(text: composed, isUser: true));
-    prefillSw.stop();
-
     final stats = LlmStats(inputChars: userText.length);
-    final firstTokenSw = Stopwatch()..start();
-    final genSw = Stopwatch()..start();
     final buf = StringBuffer();
-    await for (final r in _chat.generateChatResponseAsync()) {
-      if (r is TextResponse) {
+    // Serialize through the process-wide engine gate: a stuck generation
+    // from any other path (companion `chat()`, gait analysis) would
+    // otherwise silently block this call forever. The 180s timeout matches
+    // the worst observed cold-prefill + long-form decode for a 3–4 sentence
+    // observation reply on mid-range Android.
+    await GemmaService.runOnEngine<void>(
+      () async {
+        final prefillSw = Stopwatch()..start();
+        await _chat.addQueryChunk(Message.text(text: composed, isUser: true));
+        prefillSw.stop();
+        final firstTokenSw = Stopwatch()..start();
+        final genSw = Stopwatch()..start();
+        await for (final r in _chat.generateChatResponseAsync()) {
+          if (r is TextResponse) {
+            if (firstTokenSw.isRunning) {
+              firstTokenSw.stop();
+              stats.firstTokenMs = firstTokenSw.elapsedMilliseconds;
+              stats.prefillMs =
+                  prefillSw.elapsedMilliseconds + stats.firstTokenMs;
+              genSw
+                ..reset()
+                ..start();
+            }
+            buf.write(r.token);
+            stats.outputTokens++;
+            stats.outputChars = buf.length;
+            stats.generationMs = genSw.elapsedMilliseconds;
+            if (stats.outputTokens % 3 == 0) {
+              onChunk?.call(buf.toString(), stats);
+            }
+          }
+        }
+        genSw.stop();
         if (firstTokenSw.isRunning) {
           firstTokenSw.stop();
           stats.firstTokenMs = firstTokenSw.elapsedMilliseconds;
           stats.prefillMs =
               prefillSw.elapsedMilliseconds + stats.firstTokenMs;
-          genSw
-            ..reset()
-            ..start();
         }
-        buf.write(r.token);
-        stats.outputTokens++;
-        stats.outputChars = buf.length;
-        stats.generationMs = genSw.elapsedMilliseconds;
-        if (stats.outputTokens % 3 == 0) {
-          onChunk?.call(buf.toString(), stats);
-        }
-      }
+      },
+      timeout: const Duration(seconds: 180),
+      label: 'gaitChat.ask',
+    );
+    var text = GemmaService._stripThink(buf.toString());
+    // Defense in depth: on-device Gemma sometimes hallucinates an OpenAI-style
+    // tool-call envelope (`{"role":"assistant","tool_calls":[...]}` or
+    // `<|tool_call|>call:show_history{}`) even though no tools are registered.
+    // The SDK passes these through as plain text, which would then be spoken
+    // verbatim by TTS. Detect any of those shapes and replace with a gentle
+    // fallback so the patient never sees raw JSON or hears curly braces.
+    if (GemmaService._looksLikeToolCallEnvelope(text)) {
+      // ignore: avoid_print
+      print('[GaitChatSession] ask: dropped tool-call envelope from reply');
+      text = "Sorry, I didn't quite catch that — could you ask in a different way?";
     }
-    genSw.stop();
-    if (firstTokenSw.isRunning) {
-      firstTokenSw.stop();
-      stats.firstTokenMs = firstTokenSw.elapsedMilliseconds;
-      stats.prefillMs =
-          prefillSw.elapsedMilliseconds + stats.firstTokenMs;
-    }
-    final text = GemmaService._stripThink(buf.toString());
     stats.outputChars = text.length;
     lastStats = stats;
     // ignore: avoid_print
@@ -1810,6 +2151,15 @@ class GaitChatSession {
   Future<void> close() async {
     if (_disposed) return;
     _disposed = true;
+    // CRITICAL: never close a chat while its warmup `generateChatResponse` is
+    // still streaming on the native engine. The on-device engine is single-
+    // threaded — abandoning a generation mid-decode leaves the engine in a
+    // queued state, after which every other caller's `generateChatResponse`
+    // (companion `chat()`, analysis, voice chat) hangs silently waiting for
+    // a slot that will never open. Wait for warmup to settle first.
+    try {
+      await _warmupFuture;
+    } catch (_) {/* warmup errors are already caught + logged in openGaitChat */}
     try {
       // ignore: avoid_dynamic_calls
       await (_chat as dynamic).close();

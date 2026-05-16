@@ -48,7 +48,7 @@ class _GaitCaptureScreenState extends ConsumerState<GaitCaptureScreen> {
   CameraController? _camera;
   // Stream-mode pose detection: lower latency, no full-frame buffering.
   // Same 33-landmark BlazePose topology as the Android side previously used.
-  final mlkit.PoseDetector _pose = mlkit.PoseDetector(
+  mlkit.PoseDetector? _pose = mlkit.PoseDetector(
     options: mlkit.PoseDetectorOptions(
       mode: mlkit.PoseDetectionMode.stream,
       model: mlkit.PoseDetectionModel.accurate,
@@ -114,7 +114,8 @@ class _GaitCaptureScreenState extends ConsumerState<GaitCaptureScreen> {
     _wakeActive = false;
     _stt.stop();
     _camera?.dispose();
-    _pose.close();
+    _pose?.close();
+    _pose = null;
     super.dispose();
   }
 
@@ -206,7 +207,11 @@ class _GaitCaptureScreenState extends ConsumerState<GaitCaptureScreen> {
           localeId: 'en_US',
           listenFor: const Duration(seconds: 15),
           pauseFor: const Duration(seconds: 3),
-          partialResults: true,
+          // Offline-only recognition — see VoiceService for the rationale.
+          listenOptions: SpeechListenOptions(
+            onDevice: true,
+            partialResults: true,
+          ),
           onResult: (r) {
             if (triggered) return;
             if (_matchesWake(r.recognizedWords)) {
@@ -382,7 +387,9 @@ class _GaitCaptureScreenState extends ConsumerState<GaitCaptureScreen> {
           '${image.width}x${image.height}, '
           'planes=${image.planes.length}, '
           'firstPlaneBytes=${image.planes.first.bytes.length}';
-      final poses = await _pose.processImage(inputImage);
+      final detector = _pose;
+      if (detector == null) return;
+      final poses = await detector.processImage(inputImage);
       final pose = poses.isEmpty ? null : poses.first;
       final landmarks = pose == null ? null : _buildLandmarkList(pose, image);
       double confidence = 0;
@@ -683,6 +690,18 @@ class _GaitCaptureScreenState extends ConsumerState<GaitCaptureScreen> {
       try {
         await _camera?.dispose();
         _camera = null;
+      } catch (_) {/* best-effort */}
+      // Also close the ML Kit pose detector before invoking the LLM. On
+      // Android, PoseDetector runs through TFLite's GPU delegate and holds
+      // an OpenCL command queue; if it's still alive when LiteRT-LM starts
+      // decoding, the queue gets invalidated mid-stream and the native
+      // executor fails with CL_INVALID_COMMAND_QUEUE (error -36). Pose work
+      // is complete by this point (all frames already processed), so it's
+      // safe to release the detector entirely. dispose() will no-op the
+      // second close on screen teardown.
+      try {
+        await _pose?.close();
+        _pose = null;
       } catch (_) {/* best-effort */}
       final sessionNumber =
           ref.read(gaitSessionsProvider).length + 1;

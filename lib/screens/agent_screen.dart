@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:permission_handler/permission_handler.dart';
@@ -5,8 +7,10 @@ import 'package:permission_handler/permission_handler.dart';
 import '../core/theme.dart';
 import '../providers/providers.dart';
 import '../services/gemma_service.dart';
+import '../services/voice_service.dart';
 import '../widgets/widgets.dart';
 import 'doctor_report_screen.dart';
+import 'exercise_coach_screen.dart';
 import 'gait_capture_screen.dart';
 import 'history_screen.dart';
 
@@ -48,8 +52,11 @@ class _AgentScreenState extends ConsumerState<AgentScreen> {
 
   @override
   void dispose() {
-    // Don't keep TTS speaking past dismissal.
-    ref.read(voiceServiceProvider).cancel();
+    // Don't keep mic / TTS alive past dismissal. Use the singleton directly
+    // — `ref.read(...)` throws "Cannot use ref after the widget was disposed"
+    // by the time dispose runs, so the cancel never fires and the recognizer
+    // stays open, restart-looping on every `error_language_unavailable`.
+    VoiceService.instance.cancel();
     super.dispose();
   }
 
@@ -122,10 +129,29 @@ class _AgentScreenState extends ConsumerState<AgentScreen> {
         _reply = reply;
         _toolCalls = calls;
       });
-      // Speak the reply, but don't block the UI on it. The user can dismiss
-      // any time; the dispose hook stops TTS.
+      // Fire TTS in parallel — DO NOT await it. Some Android TTS engines
+      // never call the completion callback that `awaitSpeakCompletion(true)`
+      // depends on (a known flutter_tts quirk on certain OEM voices). If we
+      // awaited here, the navigation auto-finish below would silently never
+      // run and the user would have to tap the manual confirm button —
+      // exactly the bug we hit. The dispose hook still stops TTS on teardown.
       // ignore: avoid_dynamic_calls
-      await voice.speak(reply);
+      unawaited(voice.speak(reply));
+
+      // If a navigation-intent tool fired, auto-finish so `routeToAgent`
+      // pushes the destination screen — the user shouldn't have to tap a
+      // confirmation button after the agent has already said "opening the
+      // walking test". 700ms gives them time to see the reply card and hear
+      // the first few words of the acknowledgement before the screen
+      // transitions; TTS gets cancelled at that point but the destination
+      // screen is the answer anyway.
+      if (!mounted) return;
+      final hasNav = calls.any((c) => c.ok && c.nav != null);
+      if (hasNav) {
+        await Future<void>.delayed(const Duration(milliseconds: 700));
+        if (!mounted) return;
+        _finish();
+      }
     } catch (e) {
       if (!mounted) return;
       setState(() {
@@ -308,6 +334,8 @@ class _AgentScreenState extends ConsumerState<AgentScreen> {
     switch (navCall.nav) {
       case 'gait_capture':
         return 'Open walking test';
+      case 'exercise':
+        return 'Open exercise coach';
       case 'history':
         return 'Open trends';
       case 'doctor_report':
@@ -478,6 +506,7 @@ class _ToolTimeline extends StatelessWidget {
         'list_medications' => 'MEDICATIONS',
         'list_appointments' => 'APPOINTMENTS',
         'start_gait_test' => 'WALKING TEST',
+        'start_exercise' => 'EXERCISE COACH',
         'show_history' => 'TRENDS',
         'generate_doctor_report' => 'DOCTOR REPORT',
         _ => name.toUpperCase(),
@@ -499,6 +528,11 @@ Future<void> routeToAgent(BuildContext context) async {
     case 'gait_capture':
       await Navigator.of(context).push(
         MaterialPageRoute(builder: (_) => const GaitCaptureScreen()),
+      );
+      break;
+    case 'exercise':
+      await Navigator.of(context).push(
+        MaterialPageRoute(builder: (_) => const ExerciseCoachScreen()),
       );
       break;
     case 'history':

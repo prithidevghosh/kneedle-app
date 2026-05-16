@@ -15,7 +15,12 @@ dependencies:
   flutter_riverpod: ^2.5.1
 
   # On-device LLM — Gemma 4 E2B via LiteRT
-  flutter_gemma: ^0.15.1
+  # Pinned to 0.15.0. 0.15.1 bumps the native LiteRT runtime to v0.11.0-b,
+  # which made the GPU/OpenCL path much more sensitive to other clients on
+  # the queue (camera, ML Kit pose) and broke multimodal gait analysis with
+  # CL_INVALID_COMMAND_QUEUE (-36) during decode. Re-evaluate once upstream
+  # stabilises that runtime.
+  flutter_gemma: 0.15.0
 
   # Pose & camera
   # google_mlkit_pose_detection works on iOS+Android with the same 33-landmark
@@ -28,6 +33,13 @@ dependencies:
   # Voice
   speech_to_text: ^7.0.0
   flutter_tts: ^4.0.2
+  # Optional offline STT engine. Disabled by default — flip `kUseVoskStt` in
+  # lib/services/stt_config.dart to route VoiceService through Vosk instead
+  # of the platform recognizer. Adds an extra ~50 MB model download on first
+  # launch (downloaded with the same flow as the Gemma weights) and removes
+  # the dependency on Google's offline speech pack.
+  vosk_flutter_service: ^0.1.1
+  http: ^1.2.0
 
   # Storage (Hive — embedded, no codegen needed for inline adapters)
   hive: ^2.2.3
@@ -45,7 +57,7 @@ dependencies:
   share_plus: ^10.1.4
 
   # Utility
-  permission_handler: ^11.3.1
+  permission_handler: ^12.0.0
   intl: ^0.19.0
   collection: ^1.18.0
 

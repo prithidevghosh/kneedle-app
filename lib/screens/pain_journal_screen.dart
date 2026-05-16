@@ -42,8 +42,23 @@ class _PainJournalScreenState extends ConsumerState<PainJournalScreen> {
       _lastReply = null;
     });
     try {
-      final turn = await ref.read(voiceServiceProvider).captureJournalEntry();
+      final turn =
+          await ref.read(voiceServiceProvider).captureJournalEntry(
+        onTranscript: (transcript) {
+          // STT just resolved — show the patient their own words right away
+          // so the wait for Gemma feels like "Kneedle heard me, now thinking"
+          // instead of dead air.
+          if (!mounted) return;
+          setState(() {
+            _heading = 'Got it — logging now';
+            _detail = 'Kneedle is reading what you said…';
+            _lastTranscript = transcript;
+            _lastReply = null;
+          });
+        },
+      );
       bumpData(ref);
+      if (!mounted) return;
       setState(() {
         if (turn.transcript.isEmpty) {
           _heading = "Didn't catch that";
@@ -51,6 +66,8 @@ class _PainJournalScreenState extends ConsumerState<PainJournalScreen> {
         } else {
           _heading = 'Logged';
           _detail = 'Saved on-device. Trends update on the Insights tab.';
+          // Transcript was already pushed via onTranscript; keep it in sync
+          // in case the final result differs from the last partial.
           _lastTranscript = turn.transcript;
           _lastReply = turn.reply;
         }
@@ -161,6 +178,33 @@ class _PainJournalScreenState extends ConsumerState<PainJournalScreen> {
                           height: 1.45,
                           color: KneedleTheme.sageDeep,
                         ),
+                      ),
+                    ] else if (_busy) ...[
+                      const SizedBox(height: KneedleTheme.space3),
+                      const Divider(color: Color(0x33FFFFFF), height: 1),
+                      const SizedBox(height: KneedleTheme.space3),
+                      const Row(
+                        children: [
+                          SizedBox(
+                            width: 14,
+                            height: 14,
+                            child: CircularProgressIndicator(
+                              strokeWidth: 2,
+                              valueColor: AlwaysStoppedAnimation<Color>(
+                                KneedleTheme.sageDeep,
+                              ),
+                            ),
+                          ),
+                          SizedBox(width: 10),
+                          Text(
+                            'Kneedle is writing…',
+                            style: TextStyle(
+                              fontSize: 13,
+                              color: KneedleTheme.sageDeep,
+                              fontWeight: FontWeight.w500,
+                            ),
+                          ),
+                        ],
                       ),
                     ],
                   ],

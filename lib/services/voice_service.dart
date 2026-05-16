@@ -6,6 +6,8 @@ import 'package:speech_to_text/speech_to_text.dart';
 
 import '../models/analysis_response.dart';
 import 'gemma_service.dart';
+import 'stt_config.dart';
+import 'vosk_stt_service.dart';
 
 /// One full cycle of the voice loop:
 ///   `mic → text → Gemma → text → speaker`
@@ -24,6 +26,24 @@ class VoiceService {
   final SpeechToText _stt = SpeechToText();
   final FlutterTts _tts = FlutterTts();
   bool _ready = false;
+
+  /// Whether to ask the platform recognizer for on-device-only operation.
+  /// Defaults to true to honour the app's offline guarantee. Callers can flip
+  /// this to false (e.g. after a permanent `error_language_unavailable`) to
+  /// fall back to the network engine on devices without an offline pack.
+  // ignore: prefer_final_fields
+  bool _preferOnDevice = false;
+
+  /// Listen options used for every `_stt.listen(...)` call. On Android this
+  /// routes through the bundled Speech Services offline language pack when
+  /// [_preferOnDevice] is true; on iOS it sets
+  /// SFSpeechRecognizer.requiresOnDeviceRecognition.
+  // ignore: prefer_const_constructors
+  SpeechListenOptions _onDeviceOptions() => SpeechListenOptions(
+        onDevice: _preferOnDevice,
+        partialResults: true,
+        cancelOnError: false,
+      );
 
   Future<void> init({String localeId = 'en_US'}) async {
     if (_ready) return;
@@ -70,7 +90,29 @@ class VoiceService {
     Duration listenFor = const Duration(seconds: 30),
     Duration pauseFor = const Duration(seconds: 4),
     String localeId = 'en_US',
+    // Fires the moment STT resolves, BEFORE the model runs. The pain
+    // journal screen uses this to render the user's transcript bubble
+    // immediately instead of making the patient stare at a "Listening…"
+    // screen for several seconds while Gemma decodes.
+    void Function(String transcript)? onTranscript,
   }) async {
+    if (kUseVoskStt) {
+      // Vosk replaces the entire STT half of the round-trip. The Gemma +
+      // TTS half is identical to the platform path below.
+      await _tts.setLanguage(localeId.replaceAll('_', '-'));
+      final transcript =
+          await VoskSttService.instance.captureUtterance(listenFor: listenFor);
+      if (transcript.isEmpty) {
+        const empty = "I didn't catch that. Could you try again?";
+        await speak(empty);
+        return const VoiceTurn(transcript: '', reply: empty);
+      }
+      onTranscript?.call(transcript);
+      final reply =
+          await GemmaService.instance.extractPainEntry(transcript);
+      unawaited(speak(reply));
+      return VoiceTurn(transcript: transcript, reply: reply);
+    }
     await init(localeId: localeId);
 
     final completer = Completer<String>();
@@ -79,7 +121,7 @@ class VoiceService {
       localeId: localeId,
       listenFor: listenFor,
       pauseFor: pauseFor,
-      partialResults: true,
+      listenOptions: _onDeviceOptions(),
       onResult: (SpeechRecognitionResult r) {
         lastWords = r.recognizedWords;
         if (r.finalResult && !completer.isCompleted) {
@@ -105,8 +147,13 @@ class VoiceService {
       return VoiceTurn(transcript: '', reply: empty);
     }
 
+    // Hand the transcript to the caller IMMEDIATELY so the UI can render
+    // the "YOU SAID" bubble while the model is still decoding. Fire-and-
+    // forget the TTS so the bubble update isn't gated on it either —
+    // some Android TTS engines never call the completion callback.
+    onTranscript?.call(transcript);
     final reply = await GemmaService.instance.extractPainEntry(transcript);
-    await speak(reply);
+    unawaited(speak(reply));
     return VoiceTurn(transcript: transcript, reply: reply);
   }
 
@@ -198,9 +245,24 @@ class VoiceService {
     return '${_manualCommitted.trim()} $tail';
   }
 
+  /// Streams partial-result updates of the manual session's running transcript.
+  /// Each emission is the full transcript heard so far (committed + current
+  /// leg partial). Cleared on [stopAndCollect].
+  void Function(String transcript)? _onPartial;
+
   /// Begin a manually-controlled listening session. Resolves nothing; pair
   /// with [stopAndCollect] to read the final transcript.
-  Future<void> startListening({String localeId = 'en_US'}) async {
+  ///
+  /// [onPartial] is invoked on every partial-result tick with the full
+  /// running transcript — used by the exercise coach to detect spoken rep
+  /// keywords in near-real-time without waiting for the leg to end.
+  Future<void> startListening({
+    String localeId = 'en_US',
+    void Function(String transcript)? onPartial,
+  }) async {
+    if (kUseVoskStt) {
+      return VoskSttService.instance.startManualSession();
+    }
     await init(localeId: localeId);
     if (_manualCompleter != null) {
       // Already listening — ignore.
@@ -210,6 +272,7 @@ class VoiceService {
     _manualCommitted = '';
     _manualLegPartial = '';
     _manualLocale = localeId;
+    _onPartial = onPartial;
 
     await _listenLeg();
 
@@ -236,10 +299,12 @@ class VoiceService {
       localeId: _manualLocale,
       listenFor: const Duration(minutes: 5),
       pauseFor: const Duration(minutes: 5),
-      partialResults: true,
+      listenOptions: _onDeviceOptions(),
       onResult: (r) {
         // Overwrite, don't append — partials are always the full leg so far.
         _manualLegPartial = r.recognizedWords;
+        final cb = _onPartial;
+        if (cb != null) cb(_manualTranscript);
       },
     );
   }
@@ -287,9 +352,13 @@ class VoiceService {
   /// user's utterance gets clipped. 600 ms is long enough for ~99 % of
   /// devices we tested and short enough to feel responsive.
   Future<String> stopAndCollect() async {
+    if (kUseVoskStt) {
+      return VoskSttService.instance.stopAndCollect();
+    }
     final completer = _manualCompleter;
     if (completer == null) return '';
     _manualCompleter = null;
+    _onPartial = null;
     _manualGuard?.cancel();
     _manualGuard = null;
     await _stt.stop();
@@ -299,20 +368,25 @@ class VoiceService {
     return out.trim();
   }
 
-  bool get isManualListening => _manualCompleter != null;
+  bool get isManualListening => kUseVoskStt
+      ? VoskSttService.instance.isManualListening
+      : _manualCompleter != null;
 
   Future<String> _captureOnce({
     required Duration listenFor,
     required Duration pauseFor,
     required String localeId,
   }) async {
+    if (kUseVoskStt) {
+      return VoskSttService.instance.captureUtterance(listenFor: listenFor);
+    }
     final completer = Completer<String>();
     var last = '';
     await _stt.listen(
       localeId: localeId,
       listenFor: listenFor,
       pauseFor: pauseFor,
-      partialResults: true,
+      listenOptions: _onDeviceOptions(),
       onResult: (r) {
         last = r.recognizedWords;
         if (r.finalResult && !completer.isCompleted) {
@@ -336,10 +410,30 @@ class VoiceService {
   }
 
   Future<void> cancel() async {
-    await _stt.stop();
+    if (kUseVoskStt) {
+      await VoskSttService.instance.cancel();
+    } else {
+      // Clear the manual session BEFORE asking the recognizer to stop —
+      // otherwise the `notListening` status callback sees a live completer
+      // and re-arms a new leg via `_maybeRestartManual`, leaving the mic
+      // running after the caller thought they'd cancelled. We also drop the
+      // partial-result callback so any in-flight callback from the dying leg
+      // can't reach a disposed listener.
+      final completer = _manualCompleter;
+      _manualCompleter = null;
+      _onPartial = null;
+      _manualGuard?.cancel();
+      _manualGuard = null;
+      _legActuallyStarted = false;
+      await _stt.stop();
+      if (completer != null && !completer.isCompleted) {
+        completer.complete(_manualTranscript);
+      }
+    }
     await _tts.stop();
   }
 
-  bool get isListening => _stt.isListening;
+  bool get isListening =>
+      kUseVoskStt ? VoskSttService.instance.isManualListening : _stt.isListening;
 }
 

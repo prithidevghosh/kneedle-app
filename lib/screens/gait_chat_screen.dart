@@ -140,16 +140,23 @@ class _GaitChatScreenState extends ConsumerState<GaitChatScreen> {
             _error = 'I didn\'t catch that — try once more in a quieter spot.');
         return;
       }
+      // Show the user's message immediately with a thinking placeholder for
+      // the assistant. Without this the patient sees nothing for ~5–30s while
+      // the model decodes, which feels broken.
+      setState(() => _turns.add(_Turn(userText: transcript)));
+      _scrollToBottom();
       // Persistent session: only the new user message gets prefilled here,
       // not the system prompt + gait context (those are already in KV cache).
       final reply = await session.ask(transcript);
       if (!mounted) return;
-      setState(() => _turns.add(_Turn(
-            userText: transcript,
-            assistantText: reply,
-            stats: session.lastStats,
-            citations: session.lastRetrieval.hits,
-          )));
+      setState(() {
+        final i = _turns.length - 1;
+        _turns[i] = _turns[i].copyWith(
+          assistantText: reply,
+          stats: session.lastStats,
+          citations: session.lastRetrieval.hits,
+        );
+      });
       _scrollToBottom();
       // Speak the reply but don't block the UI on it finishing — the user
       // can read the bubble immediately, and tapping the mic again will
@@ -211,11 +218,14 @@ class _GaitChatScreenState extends ConsumerState<GaitChatScreen> {
                     for (final t in _turns) ...[
                       _UserBubble(text: t.userText),
                       const SizedBox(height: KneedleTheme.space2),
-                      _AssistantBubble(
-                        text: t.assistantText,
-                        stats: t.stats,
-                        citations: t.citations,
-                      ),
+                      if (t.assistantText == null)
+                        const _AssistantThinkingBubble()
+                      else
+                        _AssistantBubble(
+                          text: t.assistantText!,
+                          stats: t.stats,
+                          citations: t.citations,
+                        ),
                       const SizedBox(height: KneedleTheme.space4),
                     ],
                   if (_error != null) ...[
@@ -273,14 +283,27 @@ class _GaitChatScreenState extends ConsumerState<GaitChatScreen> {
 class _Turn {
   const _Turn({
     required this.userText,
-    required this.assistantText,
+    this.assistantText,
     this.stats,
     this.citations = const [],
   });
   final String userText;
-  final String assistantText;
+  // null while the model is still thinking — UI renders a typing placeholder.
+  final String? assistantText;
   final LlmStats? stats;
   final List<KbHit> citations;
+
+  _Turn copyWith({
+    String? assistantText,
+    LlmStats? stats,
+    List<KbHit>? citations,
+  }) =>
+      _Turn(
+        userText: userText,
+        assistantText: assistantText ?? this.assistantText,
+        stats: stats ?? this.stats,
+        citations: citations ?? this.citations,
+      );
 }
 
 class _ContextHeader extends StatelessWidget {
@@ -422,35 +445,44 @@ class _CitationChips extends StatelessWidget {
           InkWell(
             onTap: () => _show(context, c),
             borderRadius: BorderRadius.circular(99),
-            child: Container(
-              padding:
-                  const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
-              decoration: BoxDecoration(
-                color: KneedleTheme.sageSoft,
-                borderRadius: BorderRadius.circular(99),
-                border: Border.all(
-                  color: KneedleTheme.sage.withValues(alpha: 0.25),
-                ),
+            child: ConstrainedBox(
+              constraints: BoxConstraints(
+                maxWidth: MediaQuery.of(context).size.width * 0.7,
               ),
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  const Icon(
-                    Icons.menu_book_rounded,
-                    size: 12,
-                    color: KneedleTheme.sageDeep,
+              child: Container(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+                decoration: BoxDecoration(
+                  color: KneedleTheme.sageSoft,
+                  borderRadius: BorderRadius.circular(99),
+                  border: Border.all(
+                    color: KneedleTheme.sage.withValues(alpha: 0.25),
                   ),
-                  const SizedBox(width: 5),
-                  Text(
-                    '${c.source} · ${c.title}',
-                    style: const TextStyle(
-                      fontSize: 11.5,
-                      fontWeight: FontWeight.w600,
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Icon(
+                      Icons.menu_book_rounded,
+                      size: 12,
                       color: KneedleTheme.sageDeep,
-                      letterSpacing: 0.1,
                     ),
-                  ),
-                ],
+                    const SizedBox(width: 5),
+                    Flexible(
+                      child: Text(
+                        '${c.source} · ${c.title}',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          fontSize: 11.5,
+                          fontWeight: FontWeight.w600,
+                          color: KneedleTheme.sageDeep,
+                          letterSpacing: 0.1,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
               ),
             ),
           ),
@@ -577,6 +609,112 @@ class _UserBubble extends StatelessWidget {
           ),
         ),
       ),
+    );
+  }
+}
+
+/// Placeholder rendered in the assistant slot while the model is still
+/// decoding. Same envelope as `_AssistantBubble` so the layout doesn't jump
+/// when the real reply replaces it.
+class _AssistantThinkingBubble extends StatelessWidget {
+  const _AssistantThinkingBubble();
+
+  @override
+  Widget build(BuildContext context) {
+    return Align(
+      alignment: Alignment.centerLeft,
+      child: ConstrainedBox(
+        constraints: BoxConstraints(
+          maxWidth: MediaQuery.of(context).size.width * 0.82,
+        ),
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+          decoration: BoxDecoration(
+            color: KneedleTheme.surface,
+            borderRadius: const BorderRadius.only(
+              topLeft: Radius.circular(18),
+              topRight: Radius.circular(18),
+              bottomLeft: Radius.circular(6),
+              bottomRight: Radius.circular(18),
+            ),
+            border: Border.all(color: KneedleTheme.hairline),
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Container(
+                width: 22,
+                height: 22,
+                decoration: const BoxDecoration(
+                  color: KneedleTheme.sageTint,
+                  shape: BoxShape.circle,
+                ),
+                alignment: Alignment.center,
+                child: const Icon(
+                  Icons.favorite_rounded,
+                  size: 12,
+                  color: KneedleTheme.sageDeep,
+                ),
+              ),
+              const SizedBox(width: 10),
+              const _ThinkingDots(),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// Three softly-pulsing dots, matching the "Kneedle is typing" affordance
+/// patients expect from any modern messaging UI.
+class _ThinkingDots extends StatefulWidget {
+  const _ThinkingDots();
+  @override
+  State<_ThinkingDots> createState() => _ThinkingDotsState();
+}
+
+class _ThinkingDotsState extends State<_ThinkingDots>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _ctrl = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 1100),
+  )..repeat();
+
+  @override
+  void dispose() {
+    _ctrl.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedBuilder(
+      animation: _ctrl,
+      builder: (_, __) {
+        final t = _ctrl.value;
+        return Row(
+          mainAxisSize: MainAxisSize.min,
+          children: List.generate(3, (i) {
+            final phase = (t - i * 0.18) % 1.0;
+            final opacity = 0.25 + 0.65 * (1 - (phase * 2 - 1).abs()).clamp(0.0, 1.0);
+            return Padding(
+              padding: EdgeInsets.only(right: i == 2 ? 0 : 5),
+              child: Opacity(
+                opacity: opacity,
+                child: Container(
+                  width: 7,
+                  height: 7,
+                  decoration: const BoxDecoration(
+                    color: KneedleTheme.sageDeep,
+                    shape: BoxShape.circle,
+                  ),
+                ),
+              ),
+            );
+          }),
+        );
+      },
     );
   }
 }
