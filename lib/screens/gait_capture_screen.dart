@@ -19,6 +19,7 @@ import '../gait/pipeline.dart';
 import '../services/gemma_service.dart';
 import '../models/gait_session.dart';
 import '../providers/providers.dart';
+import '../services/shutter_button_service.dart';
 import '../services/storage_service.dart';
 import 'gait_result_screen.dart';
 
@@ -59,6 +60,7 @@ class _GaitCaptureScreenState extends ConsumerState<GaitCaptureScreen> {
   bool _wakeActive = false;
   Future<void>? _poseReady;
   Future<bool>? _sttInitFuture;
+  StreamSubscription<String>? _shutterSub;
 
   _Phase _phase = _Phase.setup;
   int _countdown = 3;
@@ -107,16 +109,37 @@ class _GaitCaptureScreenState extends ConsumerState<GaitCaptureScreen> {
   void initState() {
     super.initState();
     _bootstrap();
+    _initShutterButton();
   }
 
   @override
   void dispose() {
     _wakeActive = false;
     _stt.stop();
+    _shutterSub?.cancel();
+    _shutterSub = null;
+    ShutterButtonService.setActive(false);
     _camera?.dispose();
     _pose?.close();
     _pose = null;
     super.dispose();
+  }
+
+  /// Wire up the Bluetooth selfie-stick / shutter remote. The native side
+  /// intercepts volume-up (and a few sibling keys) and emits an event we map
+  /// to the same action the on-screen "Start" buttons trigger. While capture
+  /// is already in progress or analysis is running we ignore the press —
+  /// recording auto-stops after [_captureSeconds].
+  void _initShutterButton() {
+    ShutterButtonService.setActive(true);
+    _shutterSub = ShutterButtonService.events.listen((_) {
+      if (!mounted) return;
+      if (_phase == _Phase.prepFrontal) {
+        _startFlow();
+      } else if (_phase == _Phase.prepSagittal) {
+        _startSagittal();
+      }
+    });
   }
 
   Future<void> _bootstrap() async {
@@ -149,7 +172,8 @@ class _GaitCaptureScreenState extends ConsumerState<GaitCaptureScreen> {
       setState(() {
         _camera = ctrl;
         _phase = _Phase.prepFrontal;
-        _status = 'Walk TOWARD the camera (frontal). Tap start when ready.';
+        _status =
+            'Walk TOWARD the camera (frontal). Tap start, press the selfie-stick button, or use volume up.';
       });
 
       // STT init also hops onto the main thread; defer until after the first
