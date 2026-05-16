@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 import 'package:hive/hive.dart';
 
 import '../gait/pipeline.dart';
@@ -5,6 +7,12 @@ import '../gait/pipeline.dart';
 /// Persisted gait session — stores the patient-facing fields we need for
 /// history charts and the doctor PDF. Raw landmark frames are NOT stored;
 /// they're discarded once the pipeline returns its summary.
+///
+/// As of the report-replay change, we ALSO persist the full LLM analysis
+/// JSON (`analysisJson`) so the result screen can be reopened from history
+/// without re-running Gemma. Older sessions saved before this field existed
+/// load with `analysisJson == null`; the UI uses that to gate the
+/// "open full report" affordance.
 class GaitSession {
   GaitSession({
     required this.id,
@@ -23,6 +31,7 @@ class GaitSession {
     required this.leftStaticAlignmentDeviation,
     required this.doubleSupportRatio,
     required this.gaitSpeedProxy,
+    this.analysisJson,
   });
 
   final int id;
@@ -42,7 +51,15 @@ class GaitSession {
   final double doubleSupportRatio;
   final double gaitSpeedProxy;
 
-  factory GaitSession.fromMetrics(GaitMetrics m, {DateTime? at}) {
+  /// `jsonEncode(AnalysisResponse.toContextJson())` from the producing
+  /// session. Null for sessions saved before report replay shipped.
+  final String? analysisJson;
+
+  factory GaitSession.fromMetrics(
+    GaitMetrics m, {
+    DateTime? at,
+    String? analysisJson,
+  }) {
     final ts = at ?? DateTime.now();
     return GaitSession(
       id: ts.millisecondsSinceEpoch ~/ 1000 & 0x7fffffff,
@@ -61,7 +78,20 @@ class GaitSession {
       leftStaticAlignmentDeviation: m.leftStaticAlignmentDeviation,
       doubleSupportRatio: m.doubleSupportRatio,
       gaitSpeedProxy: m.gaitSpeedProxy,
+      analysisJson: analysisJson,
     );
+  }
+
+  /// Decoded analysis map, or null when no full report was persisted.
+  Map<String, Object?>? decodedAnalysis() {
+    final raw = analysisJson;
+    if (raw == null || raw.isEmpty) return null;
+    try {
+      final v = jsonDecode(raw);
+      if (v is Map<String, Object?>) return v;
+      if (v is Map) return v.cast<String, Object?>();
+    } catch (_) {/* corrupt JSON — treat as no report */}
+    return null;
   }
 }
 
@@ -92,13 +122,17 @@ class GaitSessionAdapter extends TypeAdapter<GaitSession> {
       leftStaticAlignmentDeviation: (map[13] as num).toDouble(),
       doubleSupportRatio: (map[14] as num).toDouble(),
       gaitSpeedProxy: (map[15] as num).toDouble(),
+      // Field 16 is the optional analysis JSON; older saves omit it
+      // entirely, so `map[16]` is null and we leave the field as null.
+      analysisJson: map[16] as String?,
     );
   }
 
   @override
   void write(BinaryWriter w, GaitSession obj) {
+    final hasAnalysis = obj.analysisJson != null;
     w
-      ..writeByte(16)
+      ..writeByte(hasAnalysis ? 17 : 16)
       ..writeByte(0)
       ..write(obj.id)
       ..writeByte(1)
@@ -131,5 +165,10 @@ class GaitSessionAdapter extends TypeAdapter<GaitSession> {
       ..write(obj.doubleSupportRatio)
       ..writeByte(15)
       ..write(obj.gaitSpeedProxy);
+    if (hasAnalysis) {
+      w
+        ..writeByte(16)
+        ..write(obj.analysisJson);
+    }
   }
 }

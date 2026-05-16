@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io' show Platform;
 import 'dart:typed_data';
 
@@ -47,7 +48,7 @@ class _GaitCaptureScreenState extends ConsumerState<GaitCaptureScreen> {
   CameraController? _camera;
   // Stream-mode pose detection: lower latency, no full-frame buffering.
   // Same 33-landmark BlazePose topology as the Android side previously used.
-  final mlkit.PoseDetector _pose = mlkit.PoseDetector(
+  mlkit.PoseDetector? _pose = mlkit.PoseDetector(
     options: mlkit.PoseDetectorOptions(
       mode: mlkit.PoseDetectionMode.stream,
       model: mlkit.PoseDetectionModel.accurate,
@@ -113,7 +114,8 @@ class _GaitCaptureScreenState extends ConsumerState<GaitCaptureScreen> {
     _wakeActive = false;
     _stt.stop();
     _camera?.dispose();
-    _pose.close();
+    _pose?.close();
+    _pose = null;
     super.dispose();
   }
 
@@ -205,7 +207,11 @@ class _GaitCaptureScreenState extends ConsumerState<GaitCaptureScreen> {
           localeId: 'en_US',
           listenFor: const Duration(seconds: 15),
           pauseFor: const Duration(seconds: 3),
-          partialResults: true,
+          // Offline-only recognition — see VoiceService for the rationale.
+          listenOptions: SpeechListenOptions(
+            onDevice: true,
+            partialResults: true,
+          ),
           onResult: (r) {
             if (triggered) return;
             if (_matchesWake(r.recognizedWords)) {
@@ -381,7 +387,9 @@ class _GaitCaptureScreenState extends ConsumerState<GaitCaptureScreen> {
           '${image.width}x${image.height}, '
           'planes=${image.planes.length}, '
           'firstPlaneBytes=${image.planes.first.bytes.length}';
-      final poses = await _pose.processImage(inputImage);
+      final detector = _pose;
+      if (detector == null) return;
+      final poses = await detector.processImage(inputImage);
       final pose = poses.isEmpty ? null : poses.first;
       final landmarks = pose == null ? null : _buildLandmarkList(pose, image);
       double confidence = 0;
@@ -671,6 +679,30 @@ class _GaitCaptureScreenState extends ConsumerState<GaitCaptureScreen> {
       }
 
       setState(() => _status = 'Asking Gemma for guidance…');
+      // Release the camera before invoking the LLM. The camera preview's
+      // SurfaceView and LiteRT's GPU delegate share the device's OpenCL
+      // command queue; when both are active the queue can fail mid-decode
+      // with CL_INVALID_COMMAND_QUEUE (error -36), and Gemma falls back to
+      // the safety-default response. Disposing entirely (not just pausing)
+      // ensures Android also frees the surface buffers. The user navigates
+      // away on success (pushReplacement) so the controller isn't needed
+      // again; on failure we never return to the capture phase from here.
+      try {
+        await _camera?.dispose();
+        _camera = null;
+      } catch (_) {/* best-effort */}
+      // Also close the ML Kit pose detector before invoking the LLM. On
+      // Android, PoseDetector runs through TFLite's GPU delegate and holds
+      // an OpenCL command queue; if it's still alive when LiteRT-LM starts
+      // decoding, the queue gets invalidated mid-stream and the native
+      // executor fails with CL_INVALID_COMMAND_QUEUE (error -36). Pose work
+      // is complete by this point (all frames already processed), so it's
+      // safe to release the detector entirely. dispose() will no-op the
+      // second close on screen teardown.
+      try {
+        await _pose?.close();
+        _pose = null;
+      } catch (_) {/* best-effort */}
       final sessionNumber =
           ref.read(gaitSessionsProvider).length + 1;
       final llmSw = Stopwatch()..start();
@@ -702,7 +734,12 @@ class _GaitCaptureScreenState extends ConsumerState<GaitCaptureScreen> {
           'llm=${llmSw.elapsedMilliseconds}ms, '
           'total=${total.elapsedMilliseconds}ms');
 
-      final session = GaitSession.fromMetrics(gaitResult.metrics);
+      // Persist the full analysis JSON alongside the metrics so the result
+      // screen can be reopened from history without re-running Gemma.
+      final session = GaitSession.fromMetrics(
+        gaitResult.metrics,
+        analysisJson: jsonEncode(analysis.toContextJson()),
+      );
       await StorageService.saveGaitSession(session);
       if (!mounted) return;
       bumpData(ref);

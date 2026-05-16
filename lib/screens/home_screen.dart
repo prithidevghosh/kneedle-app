@@ -3,12 +3,14 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:intl/intl.dart';
 
 import '../core/theme.dart';
+import '../models/analysis_response.dart';
 import '../models/gait_session.dart';
 import '../providers/providers.dart';
 import '../widgets/widgets.dart';
 import 'agent_screen.dart';
 import 'exercise_coach_screen.dart';
 import 'gait_capture_screen.dart';
+import 'gait_result_screen.dart';
 import 'pain_journal_screen.dart';
 
 class HomeScreen extends ConsumerWidget {
@@ -498,6 +500,7 @@ class _LastGaitCard extends StatelessWidget {
     };
 
     return KCard(
+      onTap: () => openSavedGaitReport(context, session),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
@@ -615,6 +618,36 @@ class _Metric extends StatelessWidget {
       ],
     );
   }
+}
+
+/// Push the full result screen for a previously-saved session by
+/// rehydrating its persisted JSON. If the session predates the
+/// `analysisJson` field (older saves) we surface a snackbar explaining
+/// that only summary data is available; we deliberately don't open a
+/// half-empty result screen because it would look broken.
+Future<void> openSavedGaitReport(
+  BuildContext context,
+  GaitSession session,
+) async {
+  final raw = session.analysisJson;
+  final rehydrated =
+      raw == null ? null : AnalysisResponse.fromStoredJson(raw);
+  if (rehydrated == null) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text(
+          'This session was saved before reports were stored — '
+          'run a new gait check to see the full report.',
+        ),
+      ),
+    );
+    return;
+  }
+  await Navigator.of(context).push(
+    MaterialPageRoute(
+      builder: (_) => GaitResultScreen(response: rehydrated, lang: 'en'),
+    ),
+  );
 }
 
 bool _isToday(DateTime ts) {
