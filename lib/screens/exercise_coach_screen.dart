@@ -4,7 +4,9 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../core/theme.dart';
+import '../models/analysis_response.dart';
 import '../models/exercise_session.dart';
+import '../models/gait_session.dart';
 import '../providers/providers.dart';
 import '../services/storage_service.dart';
 import '../services/voice_service.dart';
@@ -33,34 +35,73 @@ class _Prescription {
     required this.name,
     required this.targetReps,
     required this.cue,
+    this.repsLabel,
+    this.reason,
   });
   final String name;
   final int targetReps;
   final String cue;
+  final String? repsLabel;
+  final String? reason;
 }
 
-const _plan = <_Prescription>[
-  _Prescription(
-    name: 'Knee flexion',
-    targetReps: 10,
-    cue: 'Bend the knee slowly, then straighten.',
-  ),
-  _Prescription(
-    name: 'Quad set',
-    targetReps: 10,
-    cue: 'Tighten the thigh and hold for five seconds.',
-  ),
-  _Prescription(
-    name: 'Heel slide',
-    targetReps: 10,
-    cue: 'Slide the heel toward the hip, then back.',
-  ),
-  _Prescription(
-    name: 'Straight leg raise',
-    targetReps: 10,
-    cue: 'Keep the knee locked and lift the leg.',
-  ),
-];
+/// Parse the first integer out of strings like "15×3" / "10x3" / "12 reps".
+/// Falls back to 10 when no number is found.
+int _parseTargetReps(String reps) {
+  final m = RegExp(r'(\d+)').firstMatch(reps);
+  if (m == null) return 10;
+  final v = int.tryParse(m.group(1)!);
+  if (v == null || v <= 0) return 10;
+  return v;
+}
+
+_Prescription _toPrescription(PrescribedExercise pe) {
+  final def = pe.def;
+  return _Prescription(
+    name: def.nameEn.isNotEmpty ? def.nameEn : def.name,
+    targetReps: _parseTargetReps(def.repsEn.isNotEmpty ? def.repsEn : def.reps),
+    cue: def.descriptionEn.isNotEmpty
+        ? def.descriptionEn
+        : def.description,
+    repsLabel: def.repsEn.isNotEmpty ? def.repsEn : def.reps,
+    reason: pe.reason,
+  );
+}
+
+class _SessionPlan {
+  _SessionPlan({
+    required this.session,
+    required this.label,
+    required this.exercises,
+  });
+  final GaitSession session;
+  final String label;
+  final List<_Prescription> exercises;
+}
+
+/// Build the per-session plan list (oldest = Session 1, newest last) from the
+/// gait history. Sessions without a persisted analysis (older saves) or with
+/// no exercises in the analysis are dropped — there's nothing to coach for
+/// them.
+List<_SessionPlan> _buildSessionPlans(List<GaitSession> sessions) {
+  // `recentGaitSessions` returns newest-first; reverse so Session 1 is the
+  // chronologically first capture.
+  final ordered = sessions.reversed.toList();
+  final out = <_SessionPlan>[];
+  for (var i = 0; i < ordered.length; i++) {
+    final s = ordered[i];
+    final raw = s.analysisJson;
+    if (raw == null || raw.isEmpty) continue;
+    final analysis = AnalysisResponse.fromStoredJson(raw);
+    if (analysis == null || analysis.exercises.isEmpty) continue;
+    out.add(_SessionPlan(
+      session: s,
+      label: 'Session ${i + 1}',
+      exercises: [for (final e in analysis.exercises) _toPrescription(e)],
+    ));
+  }
+  return out;
+}
 
 class _ExerciseCoachScreenState extends ConsumerState<ExerciseCoachScreen> {
   // Pace: one rep every 3 seconds. TTS announces the count on each tick.
@@ -71,6 +112,12 @@ class _ExerciseCoachScreenState extends ConsumerState<ExerciseCoachScreen> {
   DateTime? _started;
   bool _paused = false;
   Timer? _ticker;
+
+  // Which session's prescribed plan is currently selected. Held as a session
+  // id (stable across rebuilds) rather than an index so newly-saved sessions
+  // don't shift the selection. Null = "use the most recent session" (default
+  // when the screen opens).
+  int? _selectedSessionId;
 
   // Direct singleton handle so dispose / async callbacks don't have to touch
   // `ref` (which becomes invalid the moment the widget is disposed).
@@ -200,15 +247,38 @@ class _ExerciseCoachScreenState extends ConsumerState<ExerciseCoachScreen> {
 
   @override
   Widget build(BuildContext context) {
-    final sessions = ref.watch(exerciseSessionsProvider);
-    final today = _todaysSessions(sessions);
+    final exerciseSessions = ref.watch(exerciseSessionsProvider);
+    final gaitSessions = ref.watch(gaitSessionsProvider);
+    final today = _todaysSessions(exerciseSessions);
+    final plans = _buildSessionPlans(gaitSessions);
+
+    _SessionPlan? selected;
+    if (plans.isNotEmpty) {
+      if (_selectedSessionId != null) {
+        for (final p in plans) {
+          if (p.session.id == _selectedSessionId) {
+            selected = p;
+            break;
+          }
+        }
+      }
+      // Default: newest session (last in chronological order).
+      selected ??= plans.last;
+    }
 
     return Scaffold(
       backgroundColor: KneedleTheme.cream,
       appBar: AppBar(title: const Text('Exercise coach')),
       body: SafeArea(
         child: _active == null
-            ? _PlanView(plan: _plan, today: today, onStart: _start)
+            ? _PlanView(
+                plans: plans,
+                selected: selected,
+                today: today,
+                onSelectSession: (p) =>
+                    setState(() => _selectedSessionId = p.session.id),
+                onStart: _start,
+              )
             : _LiveCoach(
                 prescription: _active!,
                 reps: _reps,
@@ -241,18 +311,27 @@ class _ExerciseCoachScreenState extends ConsumerState<ExerciseCoachScreen> {
 
 class _PlanView extends StatelessWidget {
   const _PlanView({
-    required this.plan,
+    required this.plans,
+    required this.selected,
     required this.today,
+    required this.onSelectSession,
     required this.onStart,
   });
-  final List<_Prescription> plan;
+  final List<_SessionPlan> plans;
+  final _SessionPlan? selected;
   final Map<String, ExerciseSession> today;
+  final void Function(_SessionPlan) onSelectSession;
   final void Function(_Prescription) onStart;
 
   @override
   Widget build(BuildContext context) {
-    final completedCount =
-        plan.where((p) => (today[p.name]?.repsCompleted ?? 0) >= p.targetReps).length;
+    if (plans.isEmpty || selected == null) {
+      return _EmptyPlan();
+    }
+    final plan = selected!.exercises;
+    final completedCount = plan
+        .where((p) => (today[p.name]?.repsCompleted ?? 0) >= p.targetReps)
+        .length;
 
     return ListView(
       padding: const EdgeInsets.fromLTRB(
@@ -262,6 +341,33 @@ class _PlanView extends StatelessWidget {
         KneedleTheme.space7,
       ),
       children: [
+        if (plans.length > 1) ...[
+          Text(
+            'SESSION',
+            style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                  letterSpacing: 1.2,
+                  color: KneedleTheme.inkMuted,
+                ),
+          ),
+          const SizedBox(height: KneedleTheme.space2),
+          SingleChildScrollView(
+            scrollDirection: Axis.horizontal,
+            child: Row(
+              children: [
+                for (final p in plans) ...[
+                  _SessionChip(
+                    label: p.label,
+                    timestamp: p.session.timestamp,
+                    selected: p.session.id == selected!.session.id,
+                    onTap: () => onSelectSession(p),
+                  ),
+                  const SizedBox(width: 8),
+                ],
+              ],
+            ),
+          ),
+          const SizedBox(height: KneedleTheme.space4),
+        ],
         Container(
           padding: const EdgeInsets.all(KneedleTheme.space5),
           decoration: BoxDecoration(
@@ -304,7 +410,7 @@ class _PlanView extends StatelessWidget {
         ),
         const SizedBox(height: KneedleTheme.space5),
         Text(
-          'PRESCRIBED',
+          'PRESCRIBED · ${selected!.label.toUpperCase()}',
           style: Theme.of(context).textTheme.labelSmall?.copyWith(
                 letterSpacing: 1.2,
                 color: KneedleTheme.inkMuted,
@@ -320,6 +426,105 @@ class _PlanView extends StatelessWidget {
           const SizedBox(height: KneedleTheme.space3),
         ],
       ],
+    );
+  }
+}
+
+class _SessionChip extends StatelessWidget {
+  const _SessionChip({
+    required this.label,
+    required this.timestamp,
+    required this.selected,
+    required this.onTap,
+  });
+  final String label;
+  final DateTime timestamp;
+  final bool selected;
+  final VoidCallback onTap;
+
+  String _shortDate(DateTime t) {
+    const months = [
+      'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+      'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec',
+    ];
+    return '${months[t.month - 1]} ${t.day}';
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: selected ? KneedleTheme.sage : Colors.white,
+      borderRadius: BorderRadius.circular(99),
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(99),
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(99),
+            border: Border.all(
+              color: selected ? KneedleTheme.sage : KneedleTheme.hairline,
+            ),
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(
+                label,
+                style: TextStyle(
+                  color: selected ? Colors.white : KneedleTheme.ink,
+                  fontWeight: FontWeight.w700,
+                  fontSize: 13,
+                ),
+              ),
+              Text(
+                _shortDate(timestamp),
+                style: TextStyle(
+                  color: selected
+                      ? Colors.white.withValues(alpha: 0.85)
+                      : KneedleTheme.inkMuted,
+                  fontSize: 11,
+                  fontWeight: FontWeight.w500,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _EmptyPlan extends StatelessWidget {
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.all(KneedleTheme.space6),
+      child: Column(
+        mainAxisAlignment: MainAxisAlignment.center,
+        crossAxisAlignment: CrossAxisAlignment.center,
+        children: [
+          const Icon(
+            Icons.self_improvement_rounded,
+            size: 48,
+            color: KneedleTheme.inkFaint,
+          ),
+          const SizedBox(height: KneedleTheme.space4),
+          Text(
+            'No prescribed exercises yet',
+            textAlign: TextAlign.center,
+            style: Theme.of(context).textTheme.titleMedium,
+          ),
+          const SizedBox(height: KneedleTheme.space2),
+          const Text(
+            'Run a gait check first — the personalised exercise plan from '
+            'that report will show up here.',
+            textAlign: TextAlign.center,
+            style: TextStyle(color: KneedleTheme.inkMuted, height: 1.4),
+          ),
+        ],
+      ),
     );
   }
 }
@@ -451,7 +656,7 @@ class _ExerciseCard extends StatelessWidget {
                     ),
                     const SizedBox(height: 2),
                     Text(
-                      '${prescription.targetReps} reps · ${prescription.cue}',
+                      '${prescription.repsLabel ?? '${prescription.targetReps} reps'} · ${prescription.cue}',
                       style:
                           Theme.of(context).textTheme.bodySmall?.copyWith(
                                 color: KneedleTheme.inkMuted,

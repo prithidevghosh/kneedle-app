@@ -13,6 +13,21 @@
 -dontwarn java.awt.**
 -dontwarn javax.swing.**
 
+# flutter_local_notifications stores scheduled-notification metadata as JSON
+# and rehydrates it via Gson on app start. In release builds, R8 strips the
+# generic TypeToken information that Gson relies on, which surfaces as
+# `java.lang.RuntimeException: missing type parameter.` thrown from
+# `FlutterLocalNotificationsPlugin.loadScheduledNotifications` the first time
+# the plugin is touched after a reminder is scheduled. Keeping the plugin's
+# model classes and Gson's TypeToken machinery makes the deserializer
+# round-trip correctly. Debug builds don't run R8, which is why this only
+# shows up in the APK.
+-keep class com.dexterous.** { *; }
+-keep class com.google.gson.reflect.TypeToken { *; }
+-keep class * extends com.google.gson.reflect.TypeToken
+-keepattributes Signature
+-keepattributes *Annotation*
+
 # flutter_gemma's vision path calls into MediaPipe's image helpers when
 # we attach JPEG frames to the gait analysis prompt. The MPImage classes
 # live in `tasks-vision` which is pulled in transitively only when image
